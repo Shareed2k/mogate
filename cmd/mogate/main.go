@@ -21,6 +21,7 @@ import (
 	"github.com/shareed2k/mogate/internal/kube"
 	"github.com/shareed2k/mogate/internal/session"
 	"github.com/shareed2k/mogate/internal/sessiontransport"
+	"github.com/shareed2k/mogate/pkg/local"
 )
 
 // resolveSessionToken determines the shared session token, preferring the
@@ -130,68 +131,52 @@ func runDev(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	relay, err := egress.NewRelay(egress.RelayConfig{
-		SocketPath:     *socket,
-		RemoteAddr:     *egressControl,
-		Token:          sessionToken,
-		MaxConnections: *maxConnections,
-		Logger:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
-	})
+	// pkg/local reads the token from a file only, keeping it out of argv and the
+	// environment. Bridge the resolved token (which may have come from --token or
+	// $MOGATE_TOKEN) through a private 0600 file removed when dev returns.
+	tokenPath, cleanup, err := writeTempTokenFile(sessionToken)
 	if err != nil {
 		return err
 	}
-	devCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	relayResult := make(chan error, 1)
-	go func() { relayResult <- relay.Serve(devCtx) }()
-	if err := session.WaitForSocket(devCtx, *socket, relayResult); err != nil {
-		return err
+	defer cleanup()
+
+	root := ""
+	if *files {
+		root = "/"
 	}
-	tasks := []session.Task{
-		{Name: "outbound relay", Run: func(taskCtx context.Context) error {
-			stopped := make(chan struct{})
-			defer close(stopped)
-			go func() {
-				select {
-				case <-taskCtx.Done():
-					cancel()
-				case <-stopped:
-				}
-			}()
-			return <-relayResult
-		}},
+	return local.Run(ctx, local.Config{
+		ControlAddr:    *control,
+		EgressAddr:     *egressControl,
+		Target:         *target,
+		TokenFile:      tokenPath,
+		Socket:         *socket,
+		InjectorLib:    *library,
+		Root:           root,
+		UDP:            *udp,
+		MaxConnections: *maxConnections,
+		Modes: local.Modes{
+			Egress:   true,
+			Incoming: *incomingEnabled,
+			Files:    *files,
+		},
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}, flags.Args())
+}
+
+// writeTempTokenFile writes token to a fresh 0600 file inside a private 0700
+// directory and returns the path plus a cleanup that removes the directory.
+func writeTempTokenFile(token string) (string, func(), error) {
+	dir, err := os.MkdirTemp("", "mogate-token-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create token directory: %w", err)
 	}
-	if *incomingEnabled {
-		tasks = append(tasks, session.Task{Name: "incoming tunnel", Run: func(taskCtx context.Context) error {
-			return incoming.Forward(taskCtx, incoming.ForwardConfig{
-				ControlAddr:    *control,
-				TargetAddr:     *target,
-				Token:          sessionToken,
-				MaxConnections: *maxConnections,
-				Logger:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
-			})
-		}})
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("write token file: %w", err)
 	}
-	if *incomingEnabled && *udp {
-		tasks = append(tasks, session.Task{Name: "incoming udp tunnel", Run: func(taskCtx context.Context) error {
-			return incoming.ForwardUDP(taskCtx, incoming.ForwardConfig{
-				ControlAddr:    *control,
-				TargetAddr:     *target,
-				Token:          sessionToken,
-				MaxConnections: *maxConnections,
-				Logger:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
-			})
-		}})
-	}
-	tasks = append(tasks, session.Task{Name: "command", Run: func(taskCtx context.Context) error {
-		return execute(taskCtx, execOptions{
-			socket:  *socket,
-			library: *library,
-			files:   *files,
-		}, flags.Args())
-	}})
-	return session.Run(devCtx, tasks...)
+	return path, cleanup, nil
 }
 
 func runKubeAgent(ctx context.Context, args []string) error {
