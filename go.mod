@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/google/nftables v0.3.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/sys v0.28.0
 )
 
