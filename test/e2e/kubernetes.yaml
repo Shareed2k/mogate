@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mogate-e2e
+stringData:
+  token: 0123456789abcdef-mogate-e2e-token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mogate-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mogate-target
+  template:
+    metadata:
+      labels:
+        app: mogate-target
+    spec:
+      containers:
+        - name: application
+          image: mogate-fixture:e2e
+          imagePullPolicy: Never
+          args: ["server", "--address=:8080", "--response=remote-target"]
+          ports:
+            - {name: tcp, containerPort: 8080, protocol: TCP}
+            - {name: udp, containerPort: 8080, protocol: UDP}
+        - name: mogate
+          image: mogate:e2e
+          imagePullPolicy: Never
+          args:
+            - kube-agent
+            - --app-port=8080
+            - --agent-port=15080
+            - --proxy-port=15081
+            - --control=0.0.0.0:30000
+            - --egress-control=0.0.0.0:30001
+            - --agent-gid=65533
+            - --mode=steal
+            - --udp=true
+          env:
+            - name: MOGATE_TOKEN
+              valueFrom: {secretKeyRef: {name: mogate-e2e, key: token}}
+            - name: MOGATE_POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          securityContext:
+            # Nested k3s under Docker/Colima does not propagate NET_ADMIN to a
+            # non-root pod reliably. Privilege is limited to this E2E fixture;
+            # the production patch uses only NET_ADMIN.
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 65533
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mogate-target
+spec:
+  selector: {app: mogate-target}
+  ports:
+    - {name: tcp, port: 8080, targetPort: 8080, protocol: TCP}
+    - {name: udp, port: 8080, targetPort: 8080, protocol: UDP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster-api
+  template:
+    metadata:
+      labels:
+        app: cluster-api
+    spec:
+      containers:
+        - name: application
+          image: mogate-fixture:e2e
+          imagePullPolicy: Never
+          args: ["server", "--address=:8080", "--response=remote-cluster-api"]
+          ports:
+            - {name: tcp, containerPort: 8080, protocol: TCP}
+            - {name: udp, containerPort: 8080, protocol: UDP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cluster-api
+spec:
+  selector: {app: cluster-api}
+  ports:
+    - {name: tcp, port: 8080, targetPort: 8080, protocol: TCP}
+    - {name: udp, port: 8080, targetPort: 8080, protocol: UDP}

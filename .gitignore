@@ -1,0 +1,9 @@
+/bin/
+/work/
+/mogate
+/test/e2e/e2e
+*.so
+*.dylib
+*.h
+coverage.out
+.claude/

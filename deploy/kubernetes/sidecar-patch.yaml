@@ -1,0 +1,43 @@
+# Replace YOUR_REGISTRY/mogate:latest and apply this as a strategic merge patch
+# to the workload whose container listens on TCP port 8080. The agent owns one
+# nftables table and removes it on graceful shutdown.
+spec:
+  template:
+    spec:
+      containers:
+        - name: mogate-capture
+          image: YOUR_REGISTRY/mogate:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - kube-agent
+            - --app-port=8080
+            - --agent-port=15080
+            - --proxy-port=15081
+            - --control=0.0.0.0:30000
+            - --egress-control=0.0.0.0:30001
+            - --agent-gid=65533
+            - --mode=steal
+            - --udp=true
+          env:
+            - name: MOGATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mogate-session
+                  key: token
+            - name: MOGATE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: mogate-control
+              containerPort: 30000
+            - name: mogate-egress
+              containerPort: 30001
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65533
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN"]

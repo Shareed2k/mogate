@@ -1,0 +1,41 @@
+{
+  "magic": "MOGA",
+  "version": 1,
+  "header_size": 12,
+  "max_payload_size": 8388608,
+  "operations": [
+    {"go": "OpTCPConnect", "c": "MG_OP_TCP_CONNECT", "value": 1},
+    {"go": "OpDNSLookup", "c": "MG_OP_DNS_LOOKUP", "value": 2},
+    {"go": "OpUDPConnect", "c": "MG_OP_UDP_CONNECT", "value": 3},
+    {"go": "OpUDPSend", "c": "MG_OP_UDP_SEND", "value": 4},
+    {"go": "OpUDPReceive", "c": "MG_OP_UDP_RECEIVE", "value": 5},
+    {"go": "OpUDPOpen", "c": "MG_OP_UDP_OPEN", "value": 6},
+    {"go": "OpUDPSendTo", "c": "MG_OP_UDP_SEND_TO", "value": 7},
+    {"go": "OpUDPReceiveFrom", "c": "MG_OP_UDP_RECEIVE_FROM", "value": 8},
+    {"go": "OpUDPOpenMetadata", "c": "MG_OP_UDP_OPEN_METADATA", "value": 9},
+    {"go": "OpFileOpen", "c": "MG_OP_FILE_OPEN", "value": 10},
+    {"go": "OpFileRead", "c": "MG_OP_FILE_READ", "value": 11},
+    {"go": "OpFileWrite", "c": "MG_OP_FILE_WRITE", "value": 12},
+    {"go": "OpFileSeek", "c": "MG_OP_FILE_SEEK", "value": 13},
+    {"go": "OpFileStat", "c": "MG_OP_FILE_STAT", "value": 14},
+    {"go": "OpFileClose", "c": "MG_OP_FILE_CLOSE", "value": 15},
+    {"go": "OpUDPConnectMetadata", "c": "MG_OP_UDP_CONNECT_METADATA", "value": 16},
+    {"go": "OpUDPSendMsg", "c": "MG_OP_UDP_SEND_MSG", "value": 17},
+    {"go": "OpUDPReceiveMsg", "c": "MG_OP_UDP_RECEIVE_MSG", "value": 18}
+  ],
+  "address": {
+    "family_ipv4": 4,
+    "family_ipv6": 6,
+    "header_size": 8,
+    "ipv4_size": 12,
+    "ipv6_size": 24
+  },
+  "datagram_metadata": {
+    "size": 48,
+    "destination": 1,
+    "interface": 2,
+    "hop_limit": 4,
+    "traffic_class": 8,
+    "timestamp": 16
+  }
+}
