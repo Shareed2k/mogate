@@ -166,6 +166,39 @@ Commands launched from that shell inherit the injection. If the command itself
 starts the application, replace `bash` with that command. After sourcing the
 shell helper, the short form is `mogate-dev bash`.
 
+## Embedding
+
+The local control plane is also a small Go API, so a tool can drive an Injection
+Session directly instead of shelling out to `mogate dev`. Import
+`github.com/shareed2k/mogate/pkg/local` and call `local.Run`:
+
+```go
+import "github.com/shareed2k/mogate/pkg/local"
+
+err := local.Run(ctx, local.Config{
+    ControlAddr:    "127.0.0.1:30000",     // local addr port-forwarded to agent control
+    EgressAddr:     "127.0.0.1:30001",     // local addr port-forwarded to agent egress
+    Target:         "127.0.0.1:8080",      // local app (incoming steal/mirror target)
+    TokenFile:      "/run/mogate/token",   // 0600 file; token never on argv or env
+    Socket:         "/run/mogate/agent.sock",
+    InjectorLib:    "bin/libmogate.dylib", // libmogate.so on Linux
+    Root:           "/",                   // "" disables file redirection
+    UDP:            true,                  // include UDP tunnels alongside TCP
+    MaxConnections: 256,                   // 0 selects the internal default
+    Modes:          local.Modes{Egress: true, Incoming: true, Files: true},
+}, []string{"your-app", "--flag"})
+```
+
+`Run` establishes the egress relay, attaches the incoming TCP (and UDP, when
+`UDP` is set) tunnels when `Modes.Incoming` is enabled, and runs the command with
+the injector loaded, returning when the command exits or `ctx` is cancelled. The
+session token is read from `TokenFile` only, keeping it out of argv and the
+environment; `Run` requires a non-empty `Target` whenever `Modes.Incoming` is
+set. The in-Pod agent ships as the container image built from the `Dockerfile`,
+and the injector library is produced by `make build`. The public surface is
+intentionally just `local.{Config, Modes, Run}`, so it stays a stable pin for
+embedders.
+
 ## Incoming traffic
 
 Build and publish the capture-agent image:
