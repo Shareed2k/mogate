@@ -1,10 +1,9 @@
 # mogate
 
-`mogate` is a prototype of the local interception layer used by tools such as
-mirrord. It injects a native shim into a process and sends selected libc
+`mogate` is a prototype of a local interception layer. It injects a native shim into a process and sends selected libc
 operations to a Go relay over a protected Unix socket.
 
-This repository is an engineering foundation, not a feature-complete mirrord replacement.
+This repository is an engineering foundation, not a feature-complete interception layer.
 
 ## What works
 
@@ -146,7 +145,7 @@ bin/mogate run -- bash
 ```
 
 Alternatively, source `shell/mogate.sh` and use `mogate-inject command ...` or
-`mogate-shell`. This is the mirrord-style local path; no machine-wide TUN/VIF or
+`mogate-shell`. This is the local injection path; no machine-wide TUN/VIF or
 root daemon is installed.
 
 To combine local injection, remote cluster egress, and the incoming Kubernetes
@@ -267,7 +266,7 @@ Do not expose the Unix relay socket or remote-egress TCP port to untrusted
 users: the agent intentionally has network and filesystem authority within its
 configured boundary.
 
-## Path toward mirrord-level coverage
+## Path toward broader coverage
 
 1. Complete the filesystem surface: directories, `readlink`, mutations and an explicit `mmap` policy.
 2. Add feature-specific policies for error queues and UDP GSO/GRO where applications require them.

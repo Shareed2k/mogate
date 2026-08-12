@@ -9,10 +9,10 @@ differ between Linux and macOS. Copying the `msg_control` byte region through
 the tunnel would therefore be incorrect when the Injected Process and Remote
 Agent run on different operating systems.
 
-mirrord currently hooks `sendmsg` and `recvmsg` but explicitly ignores their
-control-message headers. Telepresence normally avoids this syscall-level
-problem because application sockets remain local kernel sockets behind its
-virtual network interface.
+Some interception layers hook `sendmsg` and `recvmsg` but explicitly ignore
+their control-message headers; others avoid this syscall-level problem entirely
+because application sockets remain local kernel sockets behind a virtual network
+interface.
 
 ## Decision
 

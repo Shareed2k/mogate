@@ -30,8 +30,7 @@ const (
 	tokenFileFlagUsage = "read the session token from a file (or MOGATE_TOKEN_FILE); preferred over --token"
 )
 
-const rootLong = `mogate is a prototype of the local interception layer used by tools such as
-mirrord. It injects a native shim into a process and proxies selected libc
+const rootLong = `mogate is a prototype of a local interception layer. It injects a native shim into a process and proxies selected libc
 operations to a Go relay over a protected Unix socket.`
 
 func main() {
