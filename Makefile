@@ -10,11 +10,17 @@ LIBRARY := $(BIN_DIR)/libmogate.so
 SHARED_FLAGS := -shared
 endif
 
-.PHONY: all build test e2e clean
+.PHONY: all generate build test e2e clean
 
 all: build
 
-build:
+# generate refreshes the code-generated protocol artifacts, including the
+# gitignored injector/protocol_generated.h header that the injector build below
+# includes. build depends on it so a fresh clone builds without a manual step.
+generate:
+	$(GO) generate ./...
+
+build: generate
 	mkdir -p $(BIN_DIR)
 	$(GO) build -trimpath -o $(BIN_DIR)/mogate ./cmd/mogate
 	sed -n '/^\/\*$$/,/^\*\/$$/p' injector/main.go | sed '1d;$$d;/^#cgo /d' | \
