@@ -168,6 +168,35 @@ func TestNewCapture_Validation(t *testing.T) {
 	}
 }
 
+func TestNewCapture_MirrorClaimWindow(t *testing.T) {
+	t.Parallel()
+
+	base := CaptureConfig{
+		ListenAddr:  "127.0.0.1:1",
+		ControlAddr: "127.0.0.1:2",
+		Mode:        ModeSteal,
+		Token:       testToken,
+	}
+
+	defaulted, err := NewCapture(base)
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	if got := defaulted.config.MirrorClaimWindow; got != 200*time.Millisecond {
+		t.Fatalf("default MirrorClaimWindow = %v, want 200ms", got)
+	}
+
+	configured := base
+	configured.MirrorClaimWindow = 750 * time.Millisecond
+	custom, err := NewCapture(configured)
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	if got := custom.config.MirrorClaimWindow; got != 750*time.Millisecond {
+		t.Fatalf("configured MirrorClaimWindow = %v, want 750ms", got)
+	}
+}
+
 func newTestCapture(t *testing.T, mode Mode, upstream string) (*Capture, string, string) {
 	t.Helper()
 	captureAddr := freeAddress(t)

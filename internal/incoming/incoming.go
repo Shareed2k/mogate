@@ -25,17 +25,24 @@ const (
 )
 
 type CaptureConfig struct {
-	ListenAddr     string
-	ControlAddr    string
-	UpstreamAddr   string
-	Token          string
-	Mode           Mode
-	ClaimTimeout   time.Duration
-	DialTimeout    time.Duration
-	MaxConnections int
-	EnableUDP      bool
-	UDPIdleTimeout time.Duration
-	Logger         *slog.Logger
+	ListenAddr   string
+	ControlAddr  string
+	UpstreamAddr string
+	Token        string
+	Mode         Mode
+	ClaimTimeout time.Duration
+	// MirrorClaimWindow bounds how long a mirror copy waits for a local watcher
+	// to claim a connection before falling back to the upstream-only response.
+	// It caps the worst-case delay a mirror adds to the real response, so it is
+	// kept short by default (200ms) and only the smaller of it and ClaimTimeout
+	// applies. Raise it for high-latency transports where a local claim needs
+	// longer to arrive. It has no effect in steal mode.
+	MirrorClaimWindow time.Duration
+	DialTimeout       time.Duration
+	MaxConnections    int
+	EnableUDP         bool
+	UDPIdleTimeout    time.Duration
+	Logger            *slog.Logger
 }
 
 type Capture struct {
@@ -68,6 +75,9 @@ func NewCapture(config CaptureConfig) (*Capture, error) {
 	}
 	if config.ClaimTimeout <= 0 {
 		config.ClaimTimeout = 2 * time.Second
+	}
+	if config.MirrorClaimWindow <= 0 {
+		config.MirrorClaimWindow = 200 * time.Millisecond
 	}
 	if config.DialTimeout <= 0 {
 		config.DialTimeout = 5 * time.Second
@@ -401,7 +411,7 @@ func (c *Capture) handleIncoming(ctx context.Context, client net.Conn) error {
 	if watcher == nil {
 		return bridge(ctx, client, upstream)
 	}
-	local, claimErr := waitForClaim(ctx, claim, min(c.config.ClaimTimeout, 200*time.Millisecond))
+	local, claimErr := waitForClaim(ctx, claim, min(c.config.ClaimTimeout, c.config.MirrorClaimWindow))
 	if claimErr != nil {
 		return bridge(ctx, client, upstream)
 	}

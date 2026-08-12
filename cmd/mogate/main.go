@@ -230,15 +230,16 @@ func newDevCommand() *cobra.Command {
 // newIncomingAgentCommand captures remote TCP/UDP traffic for steal or mirror.
 func newIncomingAgentCommand() *cobra.Command {
 	var (
-		listen         string
-		control        string
-		upstream       string
-		mode           string
-		token          string
-		tokenFile      string
-		claimTimeout   time.Duration
-		maxConnections int
-		udp            bool
+		listen            string
+		control           string
+		upstream          string
+		mode              string
+		token             string
+		tokenFile         string
+		claimTimeout      time.Duration
+		mirrorClaimWindow time.Duration
+		maxConnections    int
+		udp               bool
 	)
 	cmd := &cobra.Command{
 		Use:   "incoming-agent [flags]",
@@ -250,15 +251,16 @@ func newIncomingAgentCommand() *cobra.Command {
 				return err
 			}
 			capture, err := incoming.NewCapture(incoming.CaptureConfig{
-				ListenAddr:     listen,
-				ControlAddr:    control,
-				UpstreamAddr:   upstream,
-				Token:          sessionToken,
-				Mode:           incoming.Mode(mode),
-				ClaimTimeout:   claimTimeout,
-				MaxConnections: maxConnections,
-				EnableUDP:      udp,
-				Logger:         stderrLogger(),
+				ListenAddr:        listen,
+				ControlAddr:       control,
+				UpstreamAddr:      upstream,
+				Token:             sessionToken,
+				Mode:              incoming.Mode(mode),
+				ClaimTimeout:      claimTimeout,
+				MirrorClaimWindow: mirrorClaimWindow,
+				MaxConnections:    maxConnections,
+				EnableUDP:         udp,
+				Logger:            stderrLogger(),
 			})
 			if err != nil {
 				return err
@@ -275,6 +277,7 @@ func newIncomingAgentCommand() *cobra.Command {
 	flags.StringVar(&token, "token", os.Getenv("MOGATE_TOKEN"), tokenFlagUsage)
 	flags.StringVar(&tokenFile, "token-file", os.Getenv("MOGATE_TOKEN_FILE"), tokenFileFlagUsage)
 	flags.DurationVar(&claimTimeout, "claim-timeout", 2*time.Second, "maximum wait for a local claim")
+	flags.DurationVar(&mirrorClaimWindow, "mirror-claim-window", 200*time.Millisecond, "mirror-mode cap on waiting for a local claim; raise for high-latency transports since it bounds the added delay to the real response")
 	flags.IntVar(&maxConnections, "max-connections", 256, "maximum concurrent connections")
 	flags.BoolVar(&udp, "udp", false, "also capture UDP on the listen address")
 	return cmd
@@ -329,21 +332,22 @@ func newIncomingCommand() *cobra.Command {
 // newKubeAgentCommand installs nftables redirects and captures pod traffic.
 func newKubeAgentCommand() *cobra.Command {
 	var (
-		appPort        uint
-		agentPort      uint
-		proxyPort      uint
-		control        string
-		egressControl  string
-		mode           string
-		token          string
-		tokenFile      string
-		table          string
-		claimTimeout   time.Duration
-		maxConnections int
-		udp            bool
-		agentGID       uint
-		root           string
-		podIP          string
+		appPort           uint
+		agentPort         uint
+		proxyPort         uint
+		control           string
+		egressControl     string
+		mode              string
+		token             string
+		tokenFile         string
+		table             string
+		claimTimeout      time.Duration
+		mirrorClaimWindow time.Duration
+		maxConnections    int
+		udp               bool
+		agentGID          uint
+		root              string
+		podIP             string
 	)
 	cmd := &cobra.Command{
 		Use:   "kube-agent [flags]",
@@ -382,15 +386,16 @@ func newKubeAgentCommand() *cobra.Command {
 			}()
 
 			capture, err := incoming.NewCapture(incoming.CaptureConfig{
-				ListenAddr:     fmt.Sprintf("0.0.0.0:%d", agentPort),
-				ControlAddr:    control,
-				UpstreamAddr:   fmt.Sprintf("127.0.0.1:%d", proxyPort),
-				Token:          sessionToken,
-				Mode:           incoming.Mode(mode),
-				ClaimTimeout:   claimTimeout,
-				MaxConnections: maxConnections,
-				EnableUDP:      udp,
-				Logger:         stderrLogger(),
+				ListenAddr:        fmt.Sprintf("0.0.0.0:%d", agentPort),
+				ControlAddr:       control,
+				UpstreamAddr:      fmt.Sprintf("127.0.0.1:%d", proxyPort),
+				Token:             sessionToken,
+				Mode:              incoming.Mode(mode),
+				ClaimTimeout:      claimTimeout,
+				MirrorClaimWindow: mirrorClaimWindow,
+				MaxConnections:    maxConnections,
+				EnableUDP:         udp,
+				Logger:            stderrLogger(),
 			})
 			if err != nil {
 				return err
@@ -430,6 +435,7 @@ func newKubeAgentCommand() *cobra.Command {
 	flags.StringVar(&tokenFile, "token-file", os.Getenv("MOGATE_TOKEN_FILE"), tokenFileFlagUsage)
 	flags.StringVar(&table, "table", kube.DefaultTableName, "dedicated nftables table name")
 	flags.DurationVar(&claimTimeout, "claim-timeout", 2*time.Second, "maximum wait for a local claim")
+	flags.DurationVar(&mirrorClaimWindow, "mirror-claim-window", 200*time.Millisecond, "mirror-mode cap on waiting for a local claim; raise for high-latency transports since it bounds the added delay to the real response")
 	flags.IntVar(&maxConnections, "max-connections", 256, "maximum concurrent connections")
 	flags.BoolVar(&udp, "udp", true, "capture UDP on the application port")
 	flags.UintVar(&agentGID, "agent-gid", 65533, "group id used to bypass the agent's own egress")
