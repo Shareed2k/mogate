@@ -57,7 +57,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen for remote egress: %w", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -80,7 +80,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			go func() {
 				defer clients.Done()
 				defer func() { <-sem }()
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				stopped := make(chan struct{})
 				go func() {
 					select {
@@ -171,8 +171,8 @@ func (r *Relay) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on relay socket: %w", err)
 	}
-	defer listener.Close()
-	defer os.Remove(r.config.SocketPath)
+	defer func() { _ = listener.Close() }()
+	defer func() { _ = os.Remove(r.config.SocketPath) }()
 	if err := os.Chmod(r.config.SocketPath, 0o600); err != nil {
 		return fmt.Errorf("protect relay socket: %w", err)
 	}
@@ -198,7 +198,7 @@ func (r *Relay) Serve(ctx context.Context) error {
 			go func() {
 				defer clients.Done()
 				defer func() { <-sem }()
-				defer local.Close()
+				defer func() { _ = local.Close() }()
 				if err := r.relay(ctx, local); err != nil && ctx.Err() == nil {
 					r.config.Logger.Debug("egress relay failed", "error", err)
 				}
@@ -215,7 +215,7 @@ func (r *Relay) relay(ctx context.Context, local net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("dial remote egress: %w", err)
 	}
-	defer remote.Close()
+	defer func() { _ = remote.Close() }()
 	return bridge(ctx, local, remote)
 }
 

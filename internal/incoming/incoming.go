@@ -104,12 +104,12 @@ func (c *Capture) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen for incoming traffic: %w", err)
 	}
-	defer incomingListener.Close()
+	defer func() { _ = incomingListener.Close() }()
 	controlListener, err := net.Listen("tcp", c.config.ControlAddr)
 	if err != nil {
 		return fmt.Errorf("listen for control traffic: %w", err)
 	}
-	defer controlListener.Close()
+	defer func() { _ = controlListener.Close() }()
 	var udpConn *net.UDPConn
 	if c.config.EnableUDP {
 		udpAddress, resolveErr := net.ResolveUDPAddr("udp", c.config.ListenAddr)
@@ -120,7 +120,7 @@ func (c *Capture) Serve(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("listen for incoming udp traffic: %w", err)
 		}
-		defer udpConn.Close()
+		defer func() { _ = udpConn.Close() }()
 		c.udpMu.Lock()
 		c.udpCapture = udpConn
 		c.udpMu.Unlock()
@@ -181,7 +181,7 @@ func (c *Capture) acceptIncoming(ctx context.Context, listener net.Listener, cli
 			go func() {
 				defer clients.Done()
 				defer func() { <-sem }()
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				if handleErr := c.handleIncoming(ctx, conn); handleErr != nil && ctx.Err() == nil {
 					c.config.Logger.Debug("incoming connection failed", "error", handleErr)
 				}
@@ -398,7 +398,7 @@ func (c *Capture) handleIncoming(ctx context.Context, client net.Conn) error {
 			}
 			return c.passThrough(ctx, client)
 		}
-		defer local.Close()
+		defer func() { _ = local.Close() }()
 		return bridge(ctx, client, local)
 	}
 
@@ -407,7 +407,7 @@ func (c *Capture) handleIncoming(ctx context.Context, client net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 	if watcher == nil {
 		return bridge(ctx, client, upstream)
 	}
@@ -415,7 +415,7 @@ func (c *Capture) handleIncoming(ctx context.Context, client net.Conn) error {
 	if claimErr != nil {
 		return bridge(ctx, client, upstream)
 	}
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 	return mirror(ctx, client, upstream, local)
 }
 
@@ -428,7 +428,7 @@ func (c *Capture) passThrough(ctx context.Context, client net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("dial passthrough upstream: %w", err)
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 	return bridge(ctx, client, upstream)
 }
 
@@ -473,7 +473,7 @@ func Forward(ctx context.Context, config ForwardConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial control: %w", err)
 	}
-	defer watch.Close()
+	defer func() { _ = watch.Close() }()
 	watchStopped := make(chan struct{})
 	defer close(watchStopped)
 	go func() {
@@ -527,12 +527,12 @@ func claimAndForward(ctx context.Context, dialer net.Dialer, config ForwardConfi
 	if err != nil {
 		return fmt.Errorf("dial local target: %w", err)
 	}
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 	claim, err := sessiontransport.Dial(ctx, config.ControlAddr, config.Token, sessiontransport.KindIncoming, config.DialTimeout)
 	if err != nil {
 		return fmt.Errorf("dial claim control: %w", err)
 	}
-	defer claim.Close()
+	defer func() { _ = claim.Close() }()
 	if err := sessiontransport.WriteMessage(claim, sessiontransport.Message{Type: sessiontransport.MessageClaim, StreamID: id}); err != nil {
 		return err
 	}

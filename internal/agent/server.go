@@ -94,8 +94,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.config.SocketPath, err)
 	}
-	defer listener.Close()
-	defer os.Remove(s.config.SocketPath)
+	defer func() { _ = listener.Close() }()
+	defer func() { _ = os.Remove(s.config.SocketPath) }()
 	if err := os.Chmod(s.config.SocketPath, 0o600); err != nil {
 		return fmt.Errorf("protect socket: %w", err)
 	}
@@ -122,7 +122,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			go func() {
 				defer clients.Done()
 				defer func() { <-sem }()
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				if handleErr := s.handle(ctx, conn); handleErr != nil && ctx.Err() == nil {
 					s.config.Logger.Debug("client failed", "error", handleErr)
 				}
@@ -168,7 +168,7 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 		}
 		return s.respond(client, operation, errnoOf(err), nil)
 	}
-	defer packet.Close()
+	defer func() { _ = packet.Close() }()
 	configureUDPMetadata(packet)
 	openOperation := protocol.OpUDPOpen
 	if withMetadata {
@@ -225,7 +225,7 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 		if readErr != nil {
 			return readErr
 		}
-		if frame.Operation != protocol.OpUDPSendTo && !(withMetadata && frame.Operation == protocol.OpUDPSendMsg) {
+		if frame.Operation != protocol.OpUDPSendTo && (!withMetadata || frame.Operation != protocol.OpUDPSendMsg) {
 			return fmt.Errorf("unexpected unconnected UDP operation %d", frame.Operation)
 		}
 		destination, consumed, parseErr := protocol.ParseAddress(frame.Payload)
@@ -263,7 +263,7 @@ func (s *Server) handleUDPMetadata(ctx context.Context, client net.Conn, address
 	if err != nil {
 		return s.respond(client, protocol.OpUDPConnectMetadata, errnoOf(err), nil)
 	}
-	defer packet.Close()
+	defer func() { _ = packet.Close() }()
 	configureUDPMetadata(packet)
 	if err := s.respond(client, protocol.OpUDPConnectMetadata, 0, nil); err != nil {
 		return err
@@ -335,7 +335,7 @@ func (s *Server) handleUDP(ctx context.Context, client net.Conn, address string)
 	if err != nil {
 		return s.respond(client, protocol.OpUDPConnect, errnoOf(err), nil)
 	}
-	defer remote.Close()
+	defer func() { _ = remote.Close() }()
 	if err := s.respond(client, protocol.OpUDPConnect, 0, nil); err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func (s *Server) handleTCP(ctx context.Context, client net.Conn, address string)
 	if err != nil {
 		return s.respond(client, protocol.OpTCPConnect, errnoOf(err), nil)
 	}
-	defer remote.Close()
+	defer func() { _ = remote.Close() }()
 	if err := s.respond(client, protocol.OpTCPConnect, 0, nil); err != nil {
 		return err
 	}
@@ -440,12 +440,12 @@ func (s *Server) handleFile(conn net.Conn, openFrame protocol.Frame) error {
 	if err != nil {
 		return s.respond(conn, protocol.OpFileOpen, errnoOf(err), nil)
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	file, err := root.OpenFile(path, osFlags(flags), os.FileMode(mode)&0o777)
 	if err != nil {
 		return s.respond(conn, protocol.OpFileOpen, errnoOf(err), nil)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if err := s.respond(conn, protocol.OpFileOpen, 0, nil); err != nil {
 		return err
 	}

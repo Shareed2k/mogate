@@ -55,7 +55,7 @@ func TestRelayRoutesProtocolToRemoteAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial relay: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := protocol.WriteFrame(conn, protocol.Frame{
 		Operation: protocol.OpTCPConnect,
 		Payload:   []byte(targetAddr),
@@ -162,7 +162,7 @@ func startTCPEcho(t *testing.T) string {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_, _ = io.Copy(conn, conn)
 	}()
 	return listener.Addr().String()
