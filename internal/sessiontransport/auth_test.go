@@ -11,8 +11,8 @@ const token = "0123456789abcdef-session"
 
 func TestBinaryHandshake(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 	serverResult := make(chan error, 1)
 	go func() {
 		binary, acceptErr := Accept(server, bufio.NewReader(server), token, KindEgress)
@@ -31,8 +31,8 @@ func TestBinaryHandshake(t *testing.T) {
 
 func TestAcceptLeavesLegacyInputBuffered(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 	go func() { _, _ = client.Write([]byte("EGRESS " + token + "\n")) }()
 	reader := bufio.NewReader(server)
 	binary, err := Accept(server, reader, token, KindEgress)

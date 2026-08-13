@@ -22,11 +22,11 @@ type result struct {
 // Session. Completion of any task ends the session and all tasks are drained.
 func Run(ctx context.Context, tasks ...Task) error {
 	if len(tasks) == 0 {
-		return errors.New("Injection Session requires at least one task")
+		return errors.New("injection session requires at least one task")
 	}
 	for _, task := range tasks {
 		if task.Name == "" || task.Run == nil {
-			return errors.New("Injection Session task requires a name and runner")
+			return errors.New("injection session task requires a name and runner")
 		}
 	}
 	sessionCtx, cancel := context.WithCancel(ctx)

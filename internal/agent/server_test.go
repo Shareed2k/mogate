@@ -47,7 +47,7 @@ func TestServer_RemoteFileRead(t *testing.T) {
 	})
 
 	conn := dialUnix(t, socket)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	openPayload := make([]byte, 8+len("/message.txt"))
 	copy(openPayload[8:], "/message.txt")
 	if err := protocol.WriteFrame(conn, protocol.Frame{Operation: protocol.OpFileOpen, Payload: openPayload}); err != nil {
@@ -80,7 +80,7 @@ func TestServer_UnconnectedUDPRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen UDP echo: %v", err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		buffer := make([]byte, 1024)
 		count, source, readErr := echo.ReadFromUDPAddrPort(buffer)
@@ -115,7 +115,7 @@ func TestServer_UnconnectedUDPRoundTrip(t *testing.T) {
 	})
 
 	conn := dialUnix(t, socket)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := protocol.WriteFrame(conn, protocol.Frame{Operation: protocol.OpUDPOpen}); err != nil {
 		t.Fatalf("UDP open request: %v", err)
 	}

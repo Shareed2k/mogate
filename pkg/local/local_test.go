@@ -99,7 +99,7 @@ func TestRun_InjectsAndDrains(t *testing.T) {
 	writeFile(t, tokenFile, validToken+"\n")
 
 	egress := idleListener(t)
-	defer egress.Close()
+	defer func() { _ = egress.Close() }()
 
 	// Record the injected socket variable, then block until the gate file
 	// appears so the test can inspect the live relay socket before Run drains.
@@ -161,7 +161,7 @@ func TestRun_CancelReturnsPromptly(t *testing.T) {
 	writeFile(t, tokenFile, validToken)
 
 	egress := idleListener(t)
-	defer egress.Close()
+	defer func() { _ = egress.Close() }()
 
 	cfg := local.Config{
 		EgressAddr:  egress.Addr().String(),

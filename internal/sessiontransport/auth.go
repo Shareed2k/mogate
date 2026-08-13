@@ -75,7 +75,7 @@ func Dial(ctx context.Context, address, token string, kind Kind, timeout time.Du
 
 func clientHandshake(conn net.Conn, token string, kind Kind) error {
 	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	var header [handshakeSize]byte
 	copy(header[:4], handshakeMagic[:])
 	header[4] = Version
@@ -115,7 +115,7 @@ func Accept(conn net.Conn, reader *bufio.Reader, token string, expected Kind) (b
 		return false, nil
 	}
 	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	var header [handshakeSize]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return true, err

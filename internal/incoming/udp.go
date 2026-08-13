@@ -258,7 +258,7 @@ func forwardUDP(ctx context.Context, config ForwardConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial udp control: %w", err)
 	}
-	defer tunnelConn.Close()
+	defer func() { _ = tunnelConn.Close() }()
 	if err := sessiontransport.WriteMessage(tunnelConn, sessiontransport.Message{Type: sessiontransport.MessageUDP}); err != nil {
 		return err
 	}

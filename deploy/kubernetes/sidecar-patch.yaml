@@ -1,13 +1,14 @@
-# Replace YOUR_REGISTRY/mogate:latest and apply this as a strategic merge patch
-# to the workload whose container listens on TCP port 8080. The agent owns one
-# nftables table and removes it on graceful shutdown.
+# Pin ghcr.io/shareed2k/mogate to a released tag (e.g. :v1.2.3) and apply this as
+# a strategic merge patch to the workload whose container listens on TCP port
+# 8080. The agent owns one nftables table and removes it on graceful shutdown.
+# The `docker` workflow publishes this image to GHCR on pushes to main and tags.
 spec:
   template:
     spec:
       containers:
         - name: mogate-capture
-          image: YOUR_REGISTRY/mogate:latest
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/shareed2k/mogate:latest
+          imagePullPolicy: Always
           args:
             - kube-agent
             - --app-port=8080

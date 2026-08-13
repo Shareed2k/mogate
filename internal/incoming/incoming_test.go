@@ -228,7 +228,7 @@ func startResponder(t *testing.T, response string) (string, <-chan string) {
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		buffer := make([]byte, 128)
 		count, _ := conn.Read(buffer)
 		received <- string(buffer[:count])
@@ -243,7 +243,7 @@ func exchange(t *testing.T, address, request string) string {
 	if err != nil {
 		t.Fatalf("dial capture: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := io.WriteString(conn, request); err != nil {
 		t.Fatalf("write request: %v", err)
 	}

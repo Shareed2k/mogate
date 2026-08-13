@@ -104,8 +104,8 @@ func TestDatagramFrameRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	first, second := net.Pipe()
-	defer first.Close()
-	defer second.Close()
+	defer func() { _ = first.Close() }()
+	defer func() { _ = second.Close() }()
 	written := make(chan error, 1)
 	go func() { written <- writeDatagramFrame(first, 42, []byte("payload")) }()
 	id, payload, err := readDatagramFrame(second)
@@ -170,7 +170,7 @@ func exchangeUDP(t *testing.T, address, request string) string {
 	if err != nil {
 		t.Fatalf("dial udp capture: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatalf("write udp request: %v", err)
 	}
