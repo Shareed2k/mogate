@@ -174,7 +174,7 @@ func newDevCommand() *cobra.Command {
 			if len(command) == 0 {
 				return errors.New("missing command after --")
 			}
-			sessionToken, err := resolveSessionToken(token, tokenFile)
+			sessionToken, err := resolveSessionToken(cmd.Context(), token, tokenFile)
 			if err != nil {
 				return err
 			}
@@ -246,7 +246,7 @@ func newIncomingAgentCommand() *cobra.Command {
 		Short: "capture remote TCP/UDP traffic for steal/mirror",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			sessionToken, err := resolveSessionToken(token, tokenFile)
+			sessionToken, err := resolveSessionToken(cmd.Context(), token, tokenFile)
 			if err != nil {
 				return err
 			}
@@ -298,7 +298,7 @@ func newIncomingCommand() *cobra.Command {
 		Short: "forward captured traffic to a local process",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			sessionToken, err := resolveSessionToken(token, tokenFile)
+			sessionToken, err := resolveSessionToken(cmd.Context(), token, tokenFile)
 			if err != nil {
 				return err
 			}
@@ -360,7 +360,7 @@ func newKubeAgentCommand() *cobra.Command {
 			if uint64(agentGID) > uint64(^uint32(0)) {
 				return errors.New("agent gid is out of range")
 			}
-			sessionToken, err := resolveSessionToken(token, tokenFile)
+			sessionToken, err := resolveSessionToken(cmd.Context(), token, tokenFile)
 			if err != nil {
 				return err
 			}
@@ -467,17 +467,26 @@ func runCombinedSession(ctx context.Context, socket, root, library string, files
 	return serveErr
 }
 
+// tokenFileWaitTimeout bounds how long the agent waits for its token file to
+// appear. An orchestrator (e.g. honey) may deliver the file a moment AFTER the
+// agent's container starts, so the agent must tolerate a brief absence instead
+// of reading once and failing. The bound keeps a delivery that never arrives
+// from hanging the agent forever.
+const tokenFileWaitTimeout = 60 * time.Second
+
 // resolveSessionToken determines the shared session token, preferring the
 // token file over the flag or environment value. A token file keeps the secret
 // out of argv (visible in ps) and out of the process environment (readable via
-// /proc/<pid>/environ and inherited by children). The resolved token is
-// validated so a weak or malformed secret fails fast at startup.
-func resolveSessionToken(flagToken, tokenFile string) (string, error) {
+// /proc/<pid>/environ and inherited by children). When a token file is given it
+// is awaited (bounded by tokenFileWaitTimeout), since the orchestrator may
+// write it just after the agent starts. The resolved token is validated so a
+// weak or malformed secret fails fast at startup.
+func resolveSessionToken(ctx context.Context, flagToken, tokenFile string) (string, error) {
 	token := flagToken
 	if tokenFile != "" {
-		data, err := os.ReadFile(tokenFile)
+		data, err := waitReadTokenFile(ctx, tokenFile, tokenFileWaitTimeout)
 		if err != nil {
-			return "", fmt.Errorf("read token file %q: %w", tokenFile, err)
+			return "", err
 		}
 		token = strings.TrimRight(string(data), " \t\r\n")
 	}
@@ -485,6 +494,32 @@ func resolveSessionToken(flagToken, tokenFile string) (string, error) {
 		return "", fmt.Errorf("session token: %w", err)
 	}
 	return token, nil
+}
+
+// waitReadTokenFile polls path until it exists and is non-empty, then returns
+// its contents. A not-yet-present or still-empty file (an orchestrator creates
+// it, then writes the token) is retried until timeout; any other read error is
+// returned immediately. A cancelled ctx or an elapsed timeout returns the wait
+// error so the agent exits rather than blocking forever.
+func waitReadTokenFile(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			return data, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read token file %q: %w", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("waiting for token file %q: %w", path, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // writeTempTokenFile writes token to a fresh 0600 file inside a private 0700
