@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"syscall"
 )
 
@@ -309,4 +310,36 @@ func codeDirectoryFlags(blob []byte) (uint32, error) {
 		return 0, fmt.Errorf("sip: unexpected code directory magic %#x", magic)
 	}
 	return binary.BigEndian.Uint32(blob[12:16]), nil
+}
+
+// codesignRunner is the seam tests replace to assert the exact codesign
+// invocations adhocResign makes without actually invoking /usr/bin/codesign.
+var codesignRunner = runCodesign
+
+// runCodesign runs /usr/bin/codesign with args, capturing stderr so a
+// failure can be reported with codesign's own diagnostic text.
+func runCodesign(args ...string) error {
+	cmd := exec.Command("/usr/bin/codesign", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sip: codesign %v: %w: %s", args, err, stderr.String())
+	}
+	return nil
+}
+
+// adhocResign strips path's existing code signature and replaces it with an
+// ad-hoc signature. An ad-hoc signature ("-s -") carries none of the
+// original signer's entitlements or hardened-runtime flags, so dyld stops
+// enforcing the restrictions (e.g. library validation) that would otherwise
+// cause it to ignore DYLD_INSERT_LIBRARIES for this copy.
+func adhocResign(path string) error {
+	// A freshly extracted/copied slice may already be unsigned, in which case
+	// --remove-signature exits non-zero ("object is not signed at all"); that
+	// is a no-op, not a failure, so its error is deliberately discarded.
+	_ = codesignRunner("--remove-signature", path)
+	if err := codesignRunner("-s", "-", "-f", path); err != nil {
+		return fmt.Errorf("sip: ad-hoc sign %q: %w", path, err)
+	}
+	return nil
 }

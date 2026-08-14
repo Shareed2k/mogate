@@ -3,10 +3,12 @@
 package local
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -182,4 +184,107 @@ func fatMachWithBogusSize(t *testing.T) []byte {
 	binary.BigEndian.PutUint32(buf[24:28], 0)     // align
 	copy(buf[28:], thin)
 	return buf
+}
+
+func TestAdhocResign(t *testing.T) {
+	t.Run("removes existing signature then applies an ad-hoc signature", func(t *testing.T) {
+		var calls [][]string
+		orig := codesignRunner
+		codesignRunner = func(args ...string) error {
+			calls = append(calls, append([]string(nil), args...))
+			return nil
+		}
+		defer func() { codesignRunner = orig }()
+
+		p := "/tmp/fixture/binary"
+		if err := adhocResign(p); err != nil {
+			t.Fatalf("adhocResign: %v", err)
+		}
+
+		want := [][]string{
+			{"--remove-signature", p},
+			{"-s", "-", "-f", p},
+		}
+		if len(calls) != len(want) {
+			t.Fatalf("calls = %v, want %v", calls, want)
+		}
+		for i, wantArgs := range want {
+			if len(calls[i]) != len(wantArgs) {
+				t.Fatalf("call %d = %v, want %v", i, calls[i], wantArgs)
+			}
+			for j, wantArg := range wantArgs {
+				if calls[i][j] != wantArg {
+					t.Fatalf("call %d = %v, want %v", i, calls[i], wantArgs)
+				}
+			}
+		}
+	})
+
+	t.Run("tolerates the not-signed no-op error from --remove-signature", func(t *testing.T) {
+		orig := codesignRunner
+		codesignRunner = func(args ...string) error {
+			if args[0] == "--remove-signature" {
+				return errors.New("object: /tmp/fixture/binary\ncode object is not signed at all")
+			}
+			return nil
+		}
+		defer func() { codesignRunner = orig }()
+
+		if err := adhocResign("/tmp/fixture/binary"); err != nil {
+			t.Fatalf("adhocResign: %v", err)
+		}
+	})
+
+	t.Run("wraps the ad-hoc sign failure", func(t *testing.T) {
+		sentinel := errors.New("boom")
+		orig := codesignRunner
+		codesignRunner = func(args ...string) error {
+			if args[0] == "-s" {
+				return sentinel
+			}
+			return nil
+		}
+		defer func() { codesignRunner = orig }()
+
+		err := adhocResign("/tmp/fixture/binary")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want it to wrap %v", err, sentinel)
+		}
+	})
+
+	t.Run("integration: really ad-hoc signs a thinned /usr/bin/true copy", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping codesign integration test in short mode")
+		}
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "true")
+		copyFile(t, "/usr/bin/true", dst)
+
+		data, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slice, _, err := chooseSlice(data)
+		if err != nil {
+			t.Fatalf("chooseSlice: %v", err)
+		}
+		if err := os.WriteFile(dst, slice, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := adhocResign(dst); err != nil {
+			t.Fatalf("adhocResign: %v", err)
+		}
+
+		out, err := exec.Command("/usr/bin/codesign", "-dvvv", dst).CombinedOutput()
+		if err != nil {
+			t.Fatalf("codesign -dvvv %q: %v\n%s", dst, err, out)
+		}
+		if !bytes.Contains(out, []byte("adhoc")) {
+			t.Fatalf("expected codesign -dvvv output to mention \"adhoc\", got:\n%s", out)
+		}
+	})
 }
