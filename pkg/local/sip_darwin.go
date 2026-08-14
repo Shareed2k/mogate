@@ -14,6 +14,19 @@ import (
 
 const sfRestricted = 0x00080000
 
+// cpu type/subtype constants (from mach/machine.h), used to pick a loadable
+// slice out of a (possibly fat) Mach-O.
+const (
+	cpuTypeX8664     = 0x01000007
+	cpuTypeArm64     = 0x0100000c
+	cpuSubtypeArm64E = 2
+)
+
+// ErrNoInjectableSlice is returned when a Mach-O offers only arm64e slices:
+// dyld enforces pointer authentication on arm64e, so DYLD_INSERT_LIBRARIES
+// injection needs a plain-arm64 or x86_64 slice instead.
+var ErrNoInjectableSlice = errors.New("sip: no injectable slice (arm64e-only); needs x86_64 or plain-arm64")
+
 // CS constants (from cs_blobs.h).
 const (
 	csMagicEmbeddedSignature = 0xfade0cc0
@@ -69,6 +82,102 @@ func isMachO(data []byte) bool {
 		return true
 	}
 	return false
+}
+
+// isFat reports whether data begins with a fat (universal) Mach-O magic, as
+// opposed to a thin one.
+func isFat(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	switch binary.BigEndian.Uint32(data[:4]) {
+	case 0xcafebabe, 0xcafebabf: // fat, fat64
+		return true
+	}
+	return false
+}
+
+// thinCPUType returns the CPU type (mach_header.cputype) of a thin Mach-O
+// slice. Callers must ensure data is a thin Mach-O (isMachO && !isFat); it
+// returns 0 if the file cannot be parsed.
+func thinCPUType(data []byte) uint32 {
+	file, err := macho.NewFile(bytes.NewReader(data))
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	return uint32(file.Cpu)
+}
+
+// chooseSlice selects a slice from a (possibly fat) Mach-O that dyld can load
+// with DYLD_INSERT_LIBRARIES honored: a plain-arm64 slice (subtype != arm64e)
+// is preferred as the native injector, falling back to x86_64 run under
+// Rosetta. An arm64e-only binary (dyld enforces pointer authentication there)
+// returns ErrNoInjectableSlice.
+func chooseSlice(data []byte) (slice []byte, arch sipArch, err error) {
+	reader := bytes.NewReader(data)
+	if fat, ferr := macho.NewFatFile(reader); ferr == nil {
+		defer fat.Close()
+		var x86Slice *macho.FatArchHeader
+		for i := range fat.Arches {
+			fa := &fat.Arches[i]
+			if isPlainArm64(fa.Cpu, fa.SubCpu) {
+				s, err := extractFatSlice(data, fa.FatArchHeader)
+				if err != nil {
+					return nil, 0, err
+				}
+				return s, sipArchNative, nil
+			}
+			if fa.Cpu == macho.CpuAmd64 && x86Slice == nil {
+				x86Slice = &fat.Arches[i].FatArchHeader
+			}
+		}
+		if x86Slice != nil {
+			s, err := extractFatSlice(data, *x86Slice)
+			if err != nil {
+				return nil, 0, err
+			}
+			return s, sipArchRosetta, nil
+		}
+		return nil, 0, ErrNoInjectableSlice
+	} else if !errors.Is(ferr, macho.ErrNotFat) {
+		return nil, 0, fmt.Errorf("sip: parse fat mach-o: %w", ferr)
+	}
+
+	file, err := macho.NewFile(bytes.NewReader(data))
+	if err != nil {
+		return nil, 0, fmt.Errorf("sip: parse mach-o: %w", err)
+	}
+	defer file.Close()
+	switch {
+	case isPlainArm64(file.Cpu, file.SubCpu):
+		return data, sipArchNative, nil
+	case file.Cpu == macho.CpuAmd64:
+		return data, sipArchRosetta, nil
+	default:
+		return nil, 0, ErrNoInjectableSlice
+	}
+}
+
+// isPlainArm64 reports whether cpu/subCpu identify an arm64 slice that is not
+// arm64e (pointer authentication enforced, which dyld will not relax for
+// DYLD_INSERT_LIBRARIES on a restricted process).
+func isPlainArm64(cpu macho.Cpu, subCpu uint32) bool {
+	return cpu == macho.CpuArm64 && subCpu&0xff != cpuSubtypeArm64E
+}
+
+// extractFatSlice returns the bytes of one architecture slice of a fat
+// Mach-O, validating that the declared offset/size fall within data so a
+// crafted fat header cannot wrap or slice out of bounds.
+func extractFatSlice(data []byte, arch macho.FatArchHeader) ([]byte, error) {
+	offset := uint64(arch.Offset)
+	size := uint64(arch.Size)
+	total := uint64(len(data))
+	end := offset + size
+	if end < offset || end > total {
+		return nil, fmt.Errorf("sip: fat arch slice [%d:%d] out of bounds for %d-byte file", offset, end, total)
+	}
+	return data[offset:end], nil
 }
 
 // codeSignatureFlags returns the CodeDirectory flags of the first slice that
