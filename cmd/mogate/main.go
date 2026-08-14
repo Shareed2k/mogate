@@ -329,7 +329,35 @@ func newIncomingCommand() *cobra.Command {
 	return cmd
 }
 
-// newKubeAgentCommand installs nftables redirects and captures pod traffic.
+// kubeAgentPlan describes what a kube-agent run will do, decided purely from
+// the --no-redirect flag before any real sockets, nftables, or netlink calls
+// happen. Tests can pin "no-redirect never touches nftables" against it
+// without exercising the real redirector or capture, which do kernel work.
+type kubeAgentPlan struct {
+	// UsesRedirector reports whether the nftables redirector (and the
+	// incoming capture it feeds) should be installed and run.
+	UsesRedirector bool
+	// TaskNames lists the session.Task names that will be scheduled, in order.
+	TaskNames []string
+}
+
+// planKubeAgent decides whether kube-agent installs the nftables redirector
+// and runs the incoming capture, or serves egress and DNS only. Egress and
+// DNS (internal/egress, internal/agent) are pure userspace: they only ever
+// call net.Dial/net.Listen and the default resolver, so they need neither
+// nftables nor CAP_NET_ADMIN. nftables is required solely to redirect and
+// capture incoming pod traffic, so --no-redirect (noRedirect true) can skip
+// the redirector and capture entirely, letting an orchestrator run the agent
+// as an unprivileged, egress-only pod for targetless/standalone use.
+func planKubeAgent(noRedirect bool) kubeAgentPlan {
+	if noRedirect {
+		return kubeAgentPlan{UsesRedirector: false, TaskNames: []string{"remote egress"}}
+	}
+	return kubeAgentPlan{UsesRedirector: true, TaskNames: []string{"incoming capture", "remote egress"}}
+}
+
+// newKubeAgentCommand installs nftables redirects and captures pod traffic,
+// or (with --no-redirect) serves egress and DNS only.
 func newKubeAgentCommand() *cobra.Command {
 	var (
 		appPort           uint
@@ -348,6 +376,7 @@ func newKubeAgentCommand() *cobra.Command {
 		agentGID          uint
 		root              string
 		podIP             string
+		noRedirect        bool
 	)
 	cmd := &cobra.Command{
 		Use:   "kube-agent [flags]",
@@ -364,42 +393,49 @@ func newKubeAgentCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			redirector, err := kube.NewRedirector(kube.RedirectConfig{
-				TableName: table,
-				AppPort:   uint16(appPort),
-				AgentPort: uint16(agentPort),
-				ProxyPort: uint16(proxyPort),
-				EnableUDP: udp,
-				AgentGID:  uint32(agentGID),
-				PodIP:     podIP,
-			})
-			if err != nil {
-				return err
-			}
-			if err := redirector.Install(); err != nil {
-				return err
-			}
-			defer func() {
-				if cleanupErr := redirector.Cleanup(); cleanupErr != nil {
-					slog.Error("nftables cleanup failed", "error", cleanupErr)
-				}
-			}()
 
-			capture, err := incoming.NewCapture(incoming.CaptureConfig{
-				ListenAddr:        fmt.Sprintf("0.0.0.0:%d", agentPort),
-				ControlAddr:       control,
-				UpstreamAddr:      fmt.Sprintf("127.0.0.1:%d", proxyPort),
-				Token:             sessionToken,
-				Mode:              incoming.Mode(mode),
-				ClaimTimeout:      claimTimeout,
-				MirrorClaimWindow: mirrorClaimWindow,
-				MaxConnections:    maxConnections,
-				EnableUDP:         udp,
-				Logger:            stderrLogger(),
-			})
-			if err != nil {
-				return err
+			plan := planKubeAgent(noRedirect)
+			var tasks []session.Task
+			if plan.UsesRedirector {
+				redirector, err := kube.NewRedirector(kube.RedirectConfig{
+					TableName: table,
+					AppPort:   uint16(appPort),
+					AgentPort: uint16(agentPort),
+					ProxyPort: uint16(proxyPort),
+					EnableUDP: udp,
+					AgentGID:  uint32(agentGID),
+					PodIP:     podIP,
+				})
+				if err != nil {
+					return err
+				}
+				if err := redirector.Install(); err != nil {
+					return err
+				}
+				defer func() {
+					if cleanupErr := redirector.Cleanup(); cleanupErr != nil {
+						slog.Error("nftables cleanup failed", "error", cleanupErr)
+					}
+				}()
+
+				capture, err := incoming.NewCapture(incoming.CaptureConfig{
+					ListenAddr:        fmt.Sprintf("0.0.0.0:%d", agentPort),
+					ControlAddr:       control,
+					UpstreamAddr:      fmt.Sprintf("127.0.0.1:%d", proxyPort),
+					Token:             sessionToken,
+					Mode:              incoming.Mode(mode),
+					ClaimTimeout:      claimTimeout,
+					MirrorClaimWindow: mirrorClaimWindow,
+					MaxConnections:    maxConnections,
+					EnableUDP:         udp,
+					Logger:            stderrLogger(),
+				})
+				if err != nil {
+					return err
+				}
+				tasks = append(tasks, session.Task{Name: "incoming capture", Run: capture.Serve})
 			}
+
 			handler, err := agent.NewHandler(agent.Config{
 				Root:           root,
 				MaxConnections: maxConnections,
@@ -417,11 +453,10 @@ func newKubeAgentCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr, "mogate kube-agent: app=%d capture=%d proxy=%d control=%s egress=%s mode=%s\n", appPort, agentPort, proxyPort, control, egressControl, mode)
-			return session.Run(cmd.Context(),
-				session.Task{Name: "incoming capture", Run: capture.Serve},
-				session.Task{Name: "remote egress", Run: egressServer.Serve},
-			)
+			tasks = append(tasks, session.Task{Name: "remote egress", Run: egressServer.Serve})
+
+			fmt.Fprintf(os.Stderr, "mogate kube-agent: app=%d capture=%d proxy=%d control=%s egress=%s mode=%s no-redirect=%t\n", appPort, agentPort, proxyPort, control, egressControl, mode, noRedirect)
+			return session.Run(cmd.Context(), tasks...)
 		},
 	}
 	flags := cmd.Flags()
@@ -441,6 +476,7 @@ func newKubeAgentCommand() *cobra.Command {
 	flags.UintVar(&agentGID, "agent-gid", 65533, "group id used to bypass the agent's own egress")
 	flags.StringVar(&root, "root", "/", "root visible to remote file operations")
 	flags.StringVar(&podIP, "pod-ip", os.Getenv("MOGATE_POD_IP"), "target Pod IP for service-mesh delivery")
+	flags.BoolVar(&noRedirect, "no-redirect", false, "serve egress+DNS only: skip the nftables redirector and incoming capture (no CAP_NET_ADMIN needed; for targetless/standalone use)")
 	return cmd
 }
 
