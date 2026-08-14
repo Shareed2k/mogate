@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,72 @@ func TestCSipParity_ChooseSlice(t *testing.T) {
 	}
 	if res.off < 0 || res.off+res.size > len(data) {
 		t.Fatalf("slice [%d:%d] out of bounds for %d-byte file", res.off, res.off+res.size, len(data))
+	}
+}
+
+// sipParityFixtureDir locates the committed Task E1 fixtures and golden .slice
+// vectors, which live with the Go port under pkg/local/testdata/sip. Both the Go
+// parity test (TestSIPChooseSliceParity) and this C parity test read the same
+// goldens, so mg_sip_choose_slice is asserted byte-identical to chooseSlice.
+const sipParityFixtureDir = "../pkg/local/testdata/sip"
+
+// TestCSipParity_GoldenVectors proves the C mg_sip_choose_slice thins each
+// committed fixture to bytes byte-identical to the golden recorded from Go's
+// chooseSlice (regenerated with `go test ./pkg/local -run
+// TestSIPChooseSliceParity -update`). The injectable fixtures (fat x86_64+arm64e
+// and thin x86_64) must yield the x86_64/Rosetta slice; the arm64e-only binary
+// and the shebang script must yield no slice (NULL), matching Go's
+// ErrNoInjectableSlice / parse-error refusals. The comparison is over the actual
+// slice bytes, not merely offset/size, so a divergent thinner cannot pass.
+func TestCSipParity_GoldenVectors(t *testing.T) {
+	cases := []struct {
+		fixture     string
+		golden      string // empty => C must return NULL (no injectable slice)
+		wantRosetta bool
+	}{
+		{fixture: "fat_x64_arm64e", golden: "fat_x64_arm64e.slice", wantRosetta: true},
+		{fixture: "thin_x64", golden: "thin_x64.slice", wantRosetta: true},
+		{fixture: "thin_arm64e"}, // arm64e-only: ErrNoInjectableSlice on the Go side
+		{fixture: "script.sh"},   // not a Mach-O: parse error on the Go side
+	}
+	for _, tc := range cases {
+		t.Run(tc.fixture, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(sipParityFixtureDir, tc.fixture))
+			if err != nil {
+				t.Fatalf("read fixture %s: %v", tc.fixture, err)
+			}
+
+			res := sipChooseSlice(data)
+
+			if tc.golden == "" {
+				if res.ok {
+					t.Fatalf("mg_sip_choose_slice(%s) chose [%d:%d] rosetta=%v, want NULL (no injectable slice)",
+						tc.fixture, res.off, res.off+res.size, res.rosetta)
+				}
+				return
+			}
+
+			if !res.ok {
+				t.Fatalf("mg_sip_choose_slice(%s) returned NULL, want a slice", tc.fixture)
+			}
+			if res.rosetta != tc.wantRosetta {
+				t.Fatalf("mg_sip_choose_slice(%s) rosetta=%v, want %v", tc.fixture, res.rosetta, tc.wantRosetta)
+			}
+			if res.off < 0 || res.size < 0 || res.off+res.size > len(data) {
+				t.Fatalf("mg_sip_choose_slice(%s) slice [%d:%d] out of bounds for %d-byte fixture",
+					tc.fixture, res.off, res.off+res.size, len(data))
+			}
+			got := data[res.off : res.off+res.size]
+
+			want, err := os.ReadFile(filepath.Join(sipParityFixtureDir, tc.golden))
+			if err != nil {
+				t.Fatalf("read golden %s (regenerate via `go test ./pkg/local -run TestSIPChooseSliceParity -update`): %v", tc.golden, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("mg_sip_choose_slice(%s) chose %d bytes that differ from golden %s (%d bytes); C and Go thinners disagree",
+					tc.fixture, len(got), tc.golden, len(want))
+			}
+		})
 	}
 }
 
