@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -285,6 +286,87 @@ func TestAdhocResign(t *testing.T) {
 		}
 		if !bytes.Contains(out, []byte("adhoc")) {
 			t.Fatalf("expected codesign -dvvv output to mention \"adhoc\", got:\n%s", out)
+		}
+	})
+}
+
+func TestReadShebang(t *testing.T) {
+	writeFile := func(t *testing.T, data []byte) string {
+		t.Helper()
+		dir := t.TempDir()
+		p := filepath.Join(dir, "script")
+		if err := os.WriteFile(p, data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	tests := []struct {
+		name       string
+		data       []byte
+		wantInterp string
+		wantArgs   []string
+		wantOK     bool
+	}{
+		{
+			name:       "simple bash shebang",
+			data:       []byte("#!/bin/bash\n"),
+			wantInterp: "/bin/bash",
+			wantArgs:   nil,
+			wantOK:     true,
+		},
+		{
+			name:       "env with an interpreter argument",
+			data:       []byte("#!/usr/bin/env python3\n"),
+			wantInterp: "/usr/bin/env",
+			wantArgs:   []string{"python3"},
+			wantOK:     true,
+		},
+		{
+			name:       "leading spaces after #! are ignored",
+			data:       []byte("#!   /bin/sh -e\n"),
+			wantInterp: "/bin/sh",
+			wantArgs:   []string{"-e"},
+			wantOK:     true,
+		},
+		{
+			name:   "a mach-o binary has no shebang",
+			data:   thinMachHeader(cpuTypeArm64, 0),
+			wantOK: false,
+		},
+		{
+			name:   "empty file",
+			data:   nil,
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := writeFile(t, tt.data)
+			interp, args, ok, err := readShebang(p)
+			if err != nil {
+				t.Fatalf("readShebang: %v", err)
+			}
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if interp != tt.wantInterp {
+				t.Fatalf("interp = %q, want %q", interp, tt.wantInterp)
+			}
+			if !slices.Equal(args, tt.wantArgs) {
+				t.Fatalf("args = %v, want %v", args, tt.wantArgs)
+			}
+		})
+	}
+
+	t.Run("a read error is wrapped", func(t *testing.T) {
+		_, _, _, err := readShebang(filepath.Join(t.TempDir(), "nope"))
+		if err == nil {
+			t.Fatal("expected an error for a missing file")
 		}
 	})
 }

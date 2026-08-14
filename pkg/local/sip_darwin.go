@@ -3,6 +3,7 @@
 package local
 
 import (
+	"bufio"
 	"bytes"
 	"debug/macho"
 	"encoding/binary"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
@@ -326,6 +328,41 @@ func runCodesign(args ...string) error {
 		return fmt.Errorf("sip: codesign %v: %w: %s", args, err, stderr.String())
 	}
 	return nil
+}
+
+// readShebang parses the first line of the file at path for a "#!interp
+// [arg...]" shebang. It reads only the first line (via bufio), not the whole
+// file. ok=false covers every non-shebang case this parser recognizes: no
+// "#!" prefix (including binaries like Mach-O), an empty file, or a "#!"
+// line with no interpreter token. It does not default a missing shebang's
+// interpreter to $SHELL; that policy belongs to the caller.
+func readShebang(path string) (interp string, args []string, ok bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("sip: open %q: %w", path, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", nil, false, fmt.Errorf("sip: read %q: %w", path, err)
+		}
+		return "", nil, false, nil // empty file
+	}
+
+	line, ok := strings.CutPrefix(scanner.Text(), "#!")
+	if !ok {
+		return "", nil, false, nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", nil, false, nil
+	}
+	if len(fields) > 1 {
+		args = fields[1:]
+	}
+	return fields[0], args, true, nil
 }
 
 // adhocResign strips path's existing code signature and replaces it with an
