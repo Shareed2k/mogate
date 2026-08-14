@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -379,4 +380,105 @@ func adhocResign(path string) error {
 		return fmt.Errorf("sip: ad-hoc sign %q: %w", path, err)
 	}
 	return nil
+}
+
+// patchIfRestricted is the top-level entrypoint execute() uses to make path
+// loadable with DYLD_INSERT_LIBRARIES honored:
+//
+//  1. If path is a "#!" script, the interpreter is patched recursively (an
+//     interpreter can itself be a restricted Mach-O, e.g. /bin/bash); the
+//     result carries the patched interpreter as both path and scriptInterp,
+//     plus the shebang's own scriptArgs, so the caller can build argv as
+//     [scriptInterp, scriptArgs..., scriptPath, origArgs...].
+//  2. Otherwise, an unrestricted binary is returned unpatched.
+//  3. A restricted binary is served from the on-disk cache if a prior call
+//     already patched it.
+//  4. Otherwise it is thinned to an injectable slice, ad-hoc re-signed, and
+//     written into the cache for next time.
+//
+// Fail-loud: any detection, thinning, signing, or I/O error is returned
+// wrapped; the caller must not fall back to running the unpatched original.
+func patchIfRestricted(path string) (sipResult, error) {
+	interp, args, isScript, err := readShebang(path)
+	if err != nil {
+		return sipResult{}, err
+	}
+	if isScript {
+		patchedInterp, err := patchIfRestricted(interp)
+		if err != nil {
+			return sipResult{}, err
+		}
+		patchedInterp.scriptInterp = patchedInterp.path
+		patchedInterp.scriptArgs = args
+		return patchedInterp, nil
+	}
+
+	restricted, err := needsSIPPatch(path)
+	if err != nil {
+		return sipResult{}, err
+	}
+	if !restricted {
+		return sipResult{path: path, arch: sipArchNative, patched: false}, nil
+	}
+
+	cachePath, err := sipCachePath(path)
+	if err != nil {
+		return sipResult{}, err
+	}
+	if cached, err := os.ReadFile(cachePath); err == nil {
+		_, arch, err := chooseSlice(cached)
+		if err != nil {
+			return sipResult{}, err
+		}
+		return sipResult{path: cachePath, arch: arch, patched: true}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return sipResult{}, fmt.Errorf("sip: read cached %q: %w", cachePath, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return sipResult{}, fmt.Errorf("sip: read %q: %w", path, err)
+	}
+	slice, arch, err := chooseSlice(data)
+	if err != nil {
+		return sipResult{}, err
+	}
+
+	cacheDir := filepath.Dir(cachePath)
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return sipResult{}, fmt.Errorf("sip: mkdir %q: %w", cacheDir, err)
+	}
+
+	tmp, err := os.CreateTemp(cacheDir, ".sip-*")
+	if err != nil {
+		return sipResult{}, fmt.Errorf("sip: create temp in %q: %w", cacheDir, err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(slice); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return sipResult{}, fmt.Errorf("sip: write %q: %w", tmpPath, err)
+	}
+	if err := tmp.Chmod(0o700); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return sipResult{}, fmt.Errorf("sip: chmod %q: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return sipResult{}, fmt.Errorf("sip: close %q: %w", tmpPath, err)
+	}
+
+	if err := adhocResign(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return sipResult{}, err
+	}
+
+	if err := os.Rename(tmpPath, cachePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return sipResult{}, fmt.Errorf("sip: rename %q -> %q: %w", tmpPath, cachePath, err)
+	}
+
+	return sipResult{path: cachePath, arch: arch, patched: true}, nil
 }

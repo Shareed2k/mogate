@@ -370,3 +370,175 @@ func TestReadShebang(t *testing.T) {
 		}
 	})
 }
+
+// withTempSipCache points the sipCacheDir seam at a fresh temp directory for
+// the duration of the calling test, restoring it on cleanup.
+func withTempSipCache(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := sipCacheDir
+	sipCacheDir = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { sipCacheDir = orig })
+	return dir
+}
+
+// restrictedThinMachHeader builds a minimal thin 64-bit Mach-O for the given
+// cpu/subtype, carrying a hand-built LC_CODE_SIGNATURE whose CodeDirectory
+// flags set CS_RUNTIME. needsSIPPatch treats that the same as the
+// SF_RESTRICTED file flag, which an unprivileged test process cannot set via
+// chflags on an arbitrary file (macOS requires a private entitlement/root).
+func restrictedThinMachHeader(cpu, subCPU uint32) []byte {
+	const (
+		headerSize     = 32
+		loadCmdSize    = 16
+		superBlobSize  = 12 + csBlobIndexSize + 16 // superblob header + 1 index + 1 CodeDirectory
+		codeDirOffset  = 12 + csBlobIndexSize      // CodeDirectory offset within the superblob
+		dataOff        = headerSize + loadCmdSize
+		totalFileBytes = dataOff + superBlobSize
+	)
+
+	buf := make([]byte, totalFileBytes)
+	copy(buf, thinMachHeader(cpu, subCPU))
+	binary.LittleEndian.PutUint32(buf[16:20], 1)           // ncmds
+	binary.LittleEndian.PutUint32(buf[20:24], loadCmdSize) // sizeofcmds
+
+	// LC_CODE_SIGNATURE load command (linkedit_data_command).
+	binary.LittleEndian.PutUint32(buf[32:36], lcCodeSignature)
+	binary.LittleEndian.PutUint32(buf[36:40], loadCmdSize)
+	binary.LittleEndian.PutUint32(buf[40:44], dataOff)
+	binary.LittleEndian.PutUint32(buf[44:48], superBlobSize)
+
+	// CS SuperBlob: 1-entry index pointing at a CodeDirectory whose flags
+	// carry CS_RUNTIME.
+	blob := buf[dataOff:]
+	binary.BigEndian.PutUint32(blob[0:4], csMagicEmbeddedSignature)
+	binary.BigEndian.PutUint32(blob[4:8], superBlobSize)
+	binary.BigEndian.PutUint32(blob[8:12], 1)
+	binary.BigEndian.PutUint32(blob[12:16], csSlotCodeDirectory)
+	binary.BigEndian.PutUint32(blob[16:20], codeDirOffset)
+	binary.BigEndian.PutUint32(blob[codeDirOffset:codeDirOffset+4], csMagicCodeDirectory)
+	binary.BigEndian.PutUint32(blob[codeDirOffset+4:codeDirOffset+8], superBlobSize) // length field, unread by our parser
+	binary.BigEndian.PutUint32(blob[codeDirOffset+8:codeDirOffset+12], 0)            // version field, unread
+	binary.BigEndian.PutUint32(blob[codeDirOffset+12:codeDirOffset+16], csRuntime)
+	return buf
+}
+
+func TestPatchIfRestricted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping codesign integration tests in short mode")
+	}
+
+	t.Run("restricted system binary is thinned, ad-hoc signed, and cached", func(t *testing.T) {
+		dir := withTempSipCache(t)
+
+		res, err := patchIfRestricted("/usr/bin/true")
+		if err != nil {
+			t.Fatalf("patchIfRestricted: %v", err)
+		}
+		if !res.patched {
+			t.Fatal("expected patched=true for a restricted system binary")
+		}
+		wantPath := filepath.Join(dir, "mogate", "sip", sipCacheVersion, "usr", "bin", "true")
+		if res.path != wantPath {
+			t.Fatalf("path = %q, want %q", res.path, wantPath)
+		}
+		info, err := os.Stat(res.path)
+		if err != nil {
+			t.Fatalf("expected the cached file to exist: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("cached file mode = %o, want 0700", perm)
+		}
+		if dirInfo, err := os.Stat(filepath.Dir(res.path)); err != nil {
+			t.Fatalf("stat cache dir: %v", err)
+		} else if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("cache dir mode = %o, want 0700", perm)
+		}
+
+		out, err := exec.Command("/usr/bin/codesign", "-dvvv", res.path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("codesign -dvvv %q: %v\n%s", res.path, err, out)
+		}
+		if !bytes.Contains(out, []byte("adhoc")) {
+			t.Fatalf("expected an ad-hoc signature, got:\n%s", out)
+		}
+
+		t.Run("a second call reuses the cache without re-signing", func(t *testing.T) {
+			var calls int
+			orig := codesignRunner
+			codesignRunner = func(args ...string) error {
+				calls++
+				return nil
+			}
+			defer func() { codesignRunner = orig }()
+
+			res2, err := patchIfRestricted("/usr/bin/true")
+			if err != nil {
+				t.Fatalf("patchIfRestricted (cached): %v", err)
+			}
+			if res2.path != res.path {
+				t.Fatalf("path = %q, want cached path %q", res2.path, res.path)
+			}
+			if !res2.patched {
+				t.Fatal("expected patched=true on a cache hit")
+			}
+			if res2.arch != res.arch {
+				t.Fatalf("arch = %v, want %v (re-derived from the cached slice)", res2.arch, res.arch)
+			}
+			if calls != 0 {
+				t.Fatalf("codesignRunner called %d times on a cache hit, want 0", calls)
+			}
+		})
+	})
+
+	t.Run("a script fixture patches its interpreter and carries shebang args", func(t *testing.T) {
+		withTempSipCache(t)
+
+		scriptDir := t.TempDir()
+		script := filepath.Join(scriptDir, "myscript")
+		if err := os.WriteFile(script, []byte("#!/bin/bash -x\necho hi\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := patchIfRestricted(script)
+		if err != nil {
+			t.Fatalf("patchIfRestricted: %v", err)
+		}
+
+		wantInterp, err := sipCachePath("/bin/bash")
+		if err != nil {
+			t.Fatalf("sipCachePath: %v", err)
+		}
+		if res.scriptInterp != wantInterp {
+			t.Fatalf("scriptInterp = %q, want the patched interpreter %q", res.scriptInterp, wantInterp)
+		}
+		if res.path != res.scriptInterp {
+			t.Fatalf("path = %q, want it to equal scriptInterp %q", res.path, res.scriptInterp)
+		}
+		if !slices.Equal(res.scriptArgs, []string{"-x"}) {
+			t.Fatalf("scriptArgs = %v, want [-x]", res.scriptArgs)
+		}
+		if !res.patched {
+			t.Fatal("expected patched=true (/bin/bash is SIP-restricted)")
+		}
+		if _, err := os.Stat(res.scriptInterp); err != nil {
+			t.Fatalf("expected the patched interpreter to exist on disk: %v", err)
+		}
+	})
+
+	t.Run("an arm64e-only restricted binary has no injectable slice", func(t *testing.T) {
+		withTempSipCache(t)
+
+		fixtureDir := t.TempDir()
+		p := filepath.Join(fixtureDir, "arm64e-only")
+		data := restrictedThinMachHeader(cpuTypeArm64, 0x80000000|cpuSubtypeArm64E)
+		if err := os.WriteFile(p, data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := patchIfRestricted(p)
+		if !errors.Is(err, ErrNoInjectableSlice) {
+			t.Fatalf("err = %v, want ErrNoInjectableSlice", err)
+		}
+	})
+}
