@@ -2225,7 +2225,16 @@ static int mg_execve_hook(const char *path, char *const argv[], char *const envp
 	if (!real) real = (mg_sip_execve_fn)mg_exec_symbol("execve");
 	if (!real) { errno = ENOSYS; return -1; }
 	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(path, argv, envp);
-	return mg_sip_execve_detour(path, argv, envp, mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	// Bracket the detour with mg_inside so the patch it performs (reading the
+	// binary, writing the cache, spawning codesign) re-enters our file/exec hooks
+	// as pass-throughs to the real calls, like every other hook in this file. The
+	// detour communicates failure via errno, so preserve it across the decrement.
+	mg_inside++;
+	int rc = mg_sip_execve_detour(path, argv, envp, mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	int saved = errno;
+	mg_inside--;
+	errno = saved;
+	return rc;
 }
 
 static int mg_execvp_hook(const char *file, char *const argv[]) {
@@ -2241,7 +2250,12 @@ static int mg_execvp_hook(const char *file, char *const argv[]) {
 		if (!real_vp) { errno = ENOSYS; return -1; }
 		return real_vp(file, argv);
 	}
-	return mg_sip_execvp_detour(file, argv, mg_self_or_null(), getenv("MOGATE_SOCKET"), real_ve);
+	mg_inside++;
+	int rc = mg_sip_execvp_detour(file, argv, mg_self_or_null(), getenv("MOGATE_SOCKET"), real_ve);
+	int saved = errno;
+	mg_inside--;
+	errno = saved;
+	return rc;
 }
 
 static int mg_posix_spawn_hook(pid_t *pid, const char *path,
@@ -2251,8 +2265,13 @@ static int mg_posix_spawn_hook(pid_t *pid, const char *path,
 	if (!real) real = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawn");
 	if (!real) return ENOSYS;
 	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(pid, path, fa, attr, argv, envp);
-	return mg_sip_posix_spawn_detour(pid, path, fa, attr, argv, envp,
+	// See mg_execve_hook: mg_inside makes the patch's own file/exec re-entries
+	// pass through. posix_spawn reports errors via its return value, not errno.
+	mg_inside++;
+	int rc = mg_sip_posix_spawn_detour(pid, path, fa, attr, argv, envp,
 		mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	mg_inside--;
+	return rc;
 }
 
 static int mg_posix_spawnp_hook(pid_t *pid, const char *file,
@@ -2270,8 +2289,11 @@ static int mg_posix_spawnp_hook(pid_t *pid, const char *file,
 		if (!real_p) return ENOSYS;
 		return real_p(pid, file, fa, attr, argv, envp);
 	}
-	return mg_sip_posix_spawnp_detour(pid, file, fa, attr, argv, envp,
+	mg_inside++;
+	int rc = mg_sip_posix_spawnp_detour(pid, file, fa, attr, argv, envp,
 		mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	mg_inside--;
+	return rc;
 }
 #endif // __APPLE__
 

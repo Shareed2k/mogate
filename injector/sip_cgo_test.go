@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -314,6 +315,105 @@ func TestCSipExecDetour_PosixSpawn(t *testing.T) {
 	}
 	if rec.path != want {
 		t.Fatalf("spawn path = %q, want the patched copy %q", rec.path, want)
+	}
+	assertInjectedEnv(t, rec.env)
+}
+
+// TestCSipExecDetour_GuardSkipsReentrantPatch is the core D2 reentrancy proof.
+// It simulates being mid-patch (mg_sip_in_patch set) and shows that a re-entrant
+// exec detour on a restricted binary does NOT patch: it calls the real exec with
+// the ORIGINAL path, the ORIGINAL argv, and the ORIGINAL env (no DYLD/MOGATE
+// rewrite). In the live dylib this is the path the codesign spawn takes, so a
+// restricted signing tool is never re-patched -> no unbounded recursion.
+//
+// The guard is thread-local, so the goroutine is pinned to its OS thread for the
+// whole test: the C call that sets the guard and the C calls that run the detours
+// must observe the same __thread variable. The guard is restored to 0 (then the
+// thread unlocked) via defers so a t.Fatalf cannot leak it into another test.
+func TestCSipExecDetour_GuardSkipsReentrantPatch(t *testing.T) {
+	// mg_sip_in_patch is a C __thread, so the C call that sets it and the C calls
+	// that run the detours must share one OS thread: pin the goroutine and keep
+	// everything on this goroutine (no t.Run, which would hop to a new one).
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	sipSetInPatch(1)
+	defer sipSetInPatch(0)
+
+	argv := []string{"/usr/bin/curl", "--version"}
+	env := []string{"PATH=/usr/bin"}
+
+	check := func(name string, rec sipExecRecord) {
+		if rec.rc != 0 {
+			t.Errorf("%s: detour rc = %d, want 0 (real exec reached directly)", name, rec.rc)
+		}
+		if rec.path != "/usr/bin/curl" {
+			t.Errorf("%s: exec path = %q, want the ORIGINAL /usr/bin/curl (guard must skip patching)", name, rec.path)
+		}
+		if !slices.Equal(rec.argv, argv) {
+			t.Errorf("%s: argv = %v, want the original %v (no rewrite under guard)", name, rec.argv, argv)
+		}
+		// Under the guard the env is passed straight through: no injection.
+		if !slices.Equal(rec.env, env) {
+			t.Errorf("%s: env = %v, want the original %v (no rewrite under guard)", name, rec.env, env)
+		}
+		if _, ok := envGet(rec.env, "DYLD_INSERT_LIBRARIES"); ok {
+			t.Errorf("%s: env injected DYLD_INSERT_LIBRARIES under guard: %v", name, rec.env)
+		}
+		if _, ok := envGet(rec.env, "MOGATE_SOCKET"); ok {
+			t.Errorf("%s: env injected MOGATE_SOCKET under guard: %v", name, rec.env)
+		}
+	}
+
+	check("posix_spawn", sipPosixSpawnDetour("/usr/bin/curl", argv, env, testSelf, testSocket))
+	check("execve", sipExecveDetour("/usr/bin/curl", argv, env, testSelf, testSocket))
+}
+
+// TestCSipPatch_SkipsSigningTools proves the belt-and-suspenders path skip: even
+// called directly, mg_sip_patch never patches the signing tools it depends on.
+// It returns NULL with an empty last error (the "run the original" outcome, not a
+// hard failure), so the detour execs /usr/bin/codesign (and /usr/bin/lipo)
+// unchanged rather than thinning + re-signing them (which would itself spawn
+// codesign). This holds regardless of the reentrancy guard.
+func TestCSipPatch_SkipsSigningTools(t *testing.T) {
+	for _, tool := range []string{"/usr/bin/codesign", "/usr/bin/lipo"} {
+		t.Run(tool, func(t *testing.T) {
+			if _, err := os.Stat(tool); err != nil {
+				t.Skipf("%s unavailable", tool)
+			}
+			// Redirect HOME so that, if the skip regressed, a produced cache copy
+			// would land in a temp dir instead of the real user cache.
+			t.Setenv("HOME", t.TempDir())
+			res := sipPatch(tool)
+			if res.ok {
+				t.Fatalf("mg_sip_patch(%q) = %q, want NULL (signing tool must not be patched)", tool, res.path)
+			}
+			if res.err != "" {
+				t.Fatalf("mg_sip_patch(%q) set last error %q, want empty (skip is a no-op, not a failure)", tool, res.err)
+			}
+		})
+	}
+}
+
+// TestCSipExecDetour_CodesignNeverPatched proves the same skip through the detour:
+// exec'ing /usr/bin/codesign resolves to the ORIGINAL path (not a thinned cache
+// copy), so the signing tool the patch pipeline itself invokes is never rewritten.
+// The environment is still injected here (the guard is not set) — only the
+// executable is left untouched.
+func TestCSipExecDetour_CodesignNeverPatched(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/codesign"); err != nil {
+		t.Skip("codesign unavailable")
+	}
+	t.Setenv("HOME", t.TempDir())
+	rec := sipPosixSpawnDetour("/usr/bin/codesign",
+		[]string{"/usr/bin/codesign", "--version"},
+		[]string{"PATH=/usr/bin"},
+		testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0", rec.rc)
+	}
+	if rec.path != "/usr/bin/codesign" {
+		t.Fatalf("exec path = %q, want the ORIGINAL /usr/bin/codesign (never patch the signing tool)", rec.path)
 	}
 	assertInjectedEnv(t, rec.env)
 }

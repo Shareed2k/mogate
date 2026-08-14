@@ -554,6 +554,19 @@ static void mg_sip_set_error(const char *msg) {
 	mg_sip_error[n] = 0;
 }
 
+// mg_sip_in_patch is the reentrancy guard (D2). mg_sip_patch brackets its whole
+// body (including the /usr/bin/codesign spawn it uses to ad-hoc re-sign a patched
+// copy) with mg_sip_in_patch++/--, so any exec the patch itself performs re-enters
+// the exec detours with the guard already set. When it is non-zero the four exec
+// detours skip patching entirely and call the real exec on the ORIGINAL path:
+// otherwise mg_sip_patch's own codesign spawn would be patched -> which spawns
+// codesign -> unbounded recursion for a restricted signing tool. It is a counter
+// (not a flag) so mg_sip_patch's single-level shebang recursion nests correctly,
+// and thread-local so one thread's patch cannot suppress another thread's detour.
+// Like every symbol in this header it is static, so each translation unit that
+// includes it (the dylib and the cgo test bridge) gets its own copy.
+static __thread int mg_sip_in_patch;
+
 // mg_sip_is_space reports whether c is one of the ASCII whitespace characters
 // unicode.IsSpace recognizes, so the shebang tokenizer splits exactly where
 // Go's strings.Fields would.
@@ -935,6 +948,26 @@ static int mg_sip_adhoc_resign(const char *path) {
 	return 0;
 }
 
+// mg_sip_is_signing_tool reports whether path is one of the code-signing tools
+// mg_sip_patch itself depends on: patching either would spawn codesign to re-sign
+// a thinned copy, and (because that spawn is itself an interposed exec) recurse.
+// The paths are matched exactly against the canonical /usr/bin locations
+// mg_sip_run_codesign / adhocResign invoke.
+static int mg_sip_is_signing_tool(const char *path) {
+	return path != NULL &&
+		(strcmp(path, "/usr/bin/codesign") == 0 || strcmp(path, "/usr/bin/lipo") == 0);
+}
+
+// Forward declaration: mg_sip_patch is the reentrancy-guarded wrapper (defined
+// after mg_sip_patch_locked); mg_sip_patch_locked's single-level shebang recursion
+// calls back through it so the guard stays set across the nested patch.
+static char *mg_sip_patch(const char *path);
+
+// mg_sip_patch_locked is the body of mg_sip_patch (see that wrapper for the
+// contract). It is invoked with the reentrancy guard mg_sip_in_patch already
+// raised, so the codesign spawn in its re-sign step re-enters the exec detours
+// with the guard set and is run un-patched instead of recursing.
+//
 // mg_sip_patch makes path loadable with DYLD_INSERT_LIBRARIES honored and returns
 // a newly malloc'd path to the executable to run (the caller frees), or NULL. The
 // NULL return is overloaded and disambiguated by mg_sip_last_error, which
@@ -949,10 +982,16 @@ static int mg_sip_adhoc_resign(const char *path) {
 //   4. Otherwise it is thinned to an injectable slice, written to a temp file in
 //      the cache dir, ad-hoc re-signed, and atomically renamed into place. The
 //      original binary is never modified.
-static char *mg_sip_patch(const char *path) {
+static char *mg_sip_patch_locked(const char *path) {
 	mg_sip_error[0] = 0;
 	if (!path) {
 		mg_sip_set_error("sip: null path");
+		return NULL;
+	}
+	// Never patch the signing tools the patch pipeline itself spawns: run them
+	// as-is (NULL + empty last-error = "no patch needed"). Belt-and-suspenders
+	// with the mg_sip_in_patch guard, and correct even outside a patch.
+	if (mg_sip_is_signing_tool(path)) {
 		return NULL;
 	}
 
@@ -1081,6 +1120,21 @@ fail:
 	free(data);
 	free(cache);
 	return NULL;
+}
+
+// mg_sip_patch wraps mg_sip_patch_locked with the D2 reentrancy guard. It raises
+// mg_sip_in_patch for the whole patch, including the /usr/bin/codesign spawn the
+// re-sign step performs: because that spawn is an interposed exec, it re-enters
+// the exec detours with the guard already set, where it is run un-patched instead
+// of recursing. The guard is a counter, so mg_sip_patch_locked's single-level
+// shebang recursion (which calls back through this wrapper) nests correctly. The
+// decrement runs on every path, including mg_sip_patch_locked's fail-loud NULL
+// return, so the guard is always cleared.
+static char *mg_sip_patch(const char *path) {
+	mg_sip_in_patch++;
+	char *result = mg_sip_patch_locked(path);
+	mg_sip_in_patch--;
+	return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1509,13 @@ typedef int (*mg_sip_spawn_fn)(pid_t *, const char *,
 // the frees below run on failure; on success the image is replaced.
 static int mg_sip_execve_detour(const char *path, char *const argv[], char *const envp[],
 	const char *self, const char *socket, mg_sip_execve_fn real) {
+	// Reentrancy guard (D2): if we are already inside mg_sip_patch (e.g. this is
+	// the codesign spawn the re-sign step performs), do not patch or rewrite the
+	// environment -- exec the ORIGINAL path directly, so patching cannot hook the
+	// signing tool it spawns and recurse.
+	if (mg_sip_in_patch) {
+		return real(path, argv, envp);
+	}
 	mg_sip_exec_target target;
 	mg_sip_resolve_exec(path, &target);
 	if (target.error) {
@@ -1500,6 +1561,13 @@ static int mg_sip_posix_spawn_detour(pid_t *pid, const char *path,
 	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
 	char *const argv[], char *const envp[],
 	const char *self, const char *socket, mg_sip_spawn_fn real) {
+	// Reentrancy guard (D2): if we are already inside mg_sip_patch (this is the
+	// codesign spawn its re-sign step performs), skip patching and spawn the
+	// ORIGINAL path directly. Without this, patching a restricted binary would
+	// patch /usr/bin/codesign, which spawns codesign, which recurses unbounded.
+	if (mg_sip_in_patch) {
+		return real(pid, path, fa, attr, argv, envp);
+	}
 	mg_sip_exec_target target;
 	mg_sip_resolve_exec(path, &target);
 	if (target.error) {

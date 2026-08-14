@@ -88,6 +88,12 @@ static int mg_test_call_posix_spawnp(const char *file, char *const argv[], char 
 	return mg_sip_posix_spawnp_detour(&pid, file, NULL, NULL, argv, envp, self, socket, mg_test_spy_spawn);
 }
 
+// mg_test_set_in_patch drives the D2 reentrancy guard directly, so a test can
+// simulate "we are mid-patch" and prove the detours short-circuit to the real
+// exec on the original path instead of re-patching (which in the live dylib would
+// recurse through the codesign spawn). The counter is restored to 0 by the test.
+static void mg_test_set_in_patch(int v) { mg_sip_in_patch = v; }
+
 static const char *mg_test_rec_path_get(void) { return mg_test_rec_path; }
 static int mg_test_rec_argv_len(void) {
 	int n = 0;
@@ -266,6 +272,13 @@ func sipPosixSpawnDetour(path string, argv, envp []string, self, socket string) 
 	C.mg_test_reset()
 	rc := C.mg_test_call_posix_spawn(cpath, cargv, cenvp, cself, csock)
 	return readExecRecord(rc)
+}
+
+// sipSetInPatch sets the C reentrancy guard mg_sip_in_patch (D2). A test sets it
+// to 1 to simulate re-entry from within mg_sip_patch's codesign spawn, then back
+// to 0 to restore the thread-local for later tests on the same goroutine/thread.
+func sipSetInPatch(v int) {
+	C.mg_test_set_in_patch(C.int(v))
 }
 
 // sipPosixSpawnpDetour drives mg_sip_posix_spawnp_detour (PATH-resolving file).
