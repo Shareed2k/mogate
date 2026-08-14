@@ -1,0 +1,203 @@
+//go:build darwin
+
+package local
+
+import (
+	"bytes"
+	"debug/macho"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"syscall"
+)
+
+const sfRestricted = 0x00080000
+
+// CS constants (from cs_blobs.h).
+const (
+	csMagicEmbeddedSignature = 0xfade0cc0
+	csMagicCodeDirectory     = 0xfade0c02
+	csSlotCodeDirectory      = 0
+	csSlotEntitlements       = 5
+	csRestrict               = 0x0000800
+	csRuntime                = 0x00010000
+)
+
+// needsSIPPatch reports whether path is a restricted Mach-O whose execution
+// would ignore DYLD_INSERT_LIBRARIES. Scripts and non-Mach-O files return false
+// (scripts are handled by the shebang path).
+func needsSIPPatch(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("sip: stat %q: %w", path, err)
+	}
+	restrictedFlag := false
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		restrictedFlag = st.Flags&sfRestricted != 0
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("sip: read %q: %w", path, err)
+	}
+	if !isMachO(data) {
+		return false, nil
+	}
+	csFlags, hasDyldEnt, err := codeSignatureFlags(data)
+	if err != nil {
+		return false, err
+	}
+	restricted := restrictedFlag || csFlags&(csRestrict|csRuntime) != 0
+	return restricted && !hasDyldEnt, nil
+}
+
+// isMachO reports whether data begins with a thin or fat Mach-O magic.
+func isMachO(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	switch binary.BigEndian.Uint32(data[:4]) {
+	case 0xcafebabe, 0xcafebabf: // fat, fat64 (big-endian)
+		return true
+	}
+	switch binary.LittleEndian.Uint32(data[:4]) {
+	case 0xfeedface, 0xfeedfacf: // thin 32/64 (little-endian host)
+		return true
+	}
+	switch binary.BigEndian.Uint32(data[:4]) {
+	case 0xfeedface, 0xfeedfacf:
+		return true
+	}
+	return false
+}
+
+// codeSignatureFlags returns the CodeDirectory flags of the first slice that
+// carries a signature, and whether the allow-dyld entitlement is present.
+// A binary with no signature returns (0, false, nil).
+func codeSignatureFlags(data []byte) (flags uint32, hasDyldEnt bool, err error) {
+	sigOff, sigSize, ok, err := firstCodeSignature(data)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	if int(sigOff)+int(sigSize) > len(data) {
+		return 0, false, errors.New("sip: code signature out of bounds")
+	}
+	blob := data[sigOff : sigOff+sigSize]
+	return parseCSSuperBlob(blob)
+}
+
+// lcCodeSignature is LC_CODE_SIGNATURE (0x1d). debug/macho does not type this
+// load command; it is a linkedit_data_command: { cmd, cmdsize, dataoff,
+// datasize }, all uint32, in the file's own byte order.
+const lcCodeSignature = 0x1d
+
+// firstCodeSignature returns the file offset and size of the code-signature
+// blob (LC_CODE_SIGNATURE) of the first Mach-O slice that carries one. For a
+// fat binary the offset is absolute within data: the arch's fat-header
+// offset plus that slice's own dataoff, since dataoff is relative to the
+// start of the slice, not the start of the fat file.
+func firstCodeSignature(data []byte) (offset, size uint32, ok bool, err error) {
+	reader := bytes.NewReader(data)
+	if fat, ferr := macho.NewFatFile(reader); ferr == nil {
+		defer fat.Close()
+		for _, arch := range fat.Arches {
+			off, sz, found, findErr := codeSignatureLoad(arch.File)
+			if findErr != nil {
+				return 0, 0, false, findErr
+			}
+			if found {
+				return arch.Offset + off, sz, true, nil
+			}
+		}
+		return 0, 0, false, nil
+	} else if !errors.Is(ferr, macho.ErrNotFat) {
+		return 0, 0, false, fmt.Errorf("sip: parse fat mach-o: %w", ferr)
+	}
+
+	file, err := macho.NewFile(reader)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("sip: parse mach-o: %w", err)
+	}
+	defer file.Close()
+	off, sz, found, err := codeSignatureLoad(file)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return off, sz, found, nil
+}
+
+// codeSignatureLoad scans f.Loads for LC_CODE_SIGNATURE and returns its
+// dataoff/datasize, relative to the start of f's own Mach-O slice.
+func codeSignatureLoad(f *macho.File) (offset, size uint32, ok bool, err error) {
+	for _, load := range f.Loads {
+		raw := load.Raw()
+		if len(raw) < 16 {
+			continue
+		}
+		if f.ByteOrder.Uint32(raw[0:4]) != lcCodeSignature {
+			continue
+		}
+		return f.ByteOrder.Uint32(raw[8:12]), f.ByteOrder.Uint32(raw[12:16]), true, nil
+	}
+	return 0, 0, false, nil
+}
+
+// csBlobIndexSize is the size of one CS_BlobIndex entry: { type, offset },
+// both big-endian uint32.
+const csBlobIndexSize = 8
+
+// csMaxBlobCount caps the SuperBlob index walk against a corrupted count
+// field; a real code signature carries a handful of slots.
+const csMaxBlobCount = 1 << 16
+
+// parseCSSuperBlob walks a CS SuperBlob's index (magic csMagicEmbeddedSignature),
+// returning the CodeDirectory flags (csSlotCodeDirectory) and whether the
+// entitlements blob (csSlotEntitlements) contains sipEntitlementAllowDyld.
+// All CS fields are big-endian.
+func parseCSSuperBlob(blob []byte) (flags uint32, hasDyldEnt bool, err error) {
+	if len(blob) < 12 {
+		return 0, false, errors.New("sip: code signature superblob too small")
+	}
+	if magic := binary.BigEndian.Uint32(blob[0:4]); magic != csMagicEmbeddedSignature {
+		return 0, false, fmt.Errorf("sip: unexpected code signature magic %#x", magic)
+	}
+	count := binary.BigEndian.Uint32(blob[8:12])
+	if count > csMaxBlobCount {
+		return 0, false, fmt.Errorf("sip: implausible code signature blob count %d", count)
+	}
+	for i := uint32(0); i < count; i++ {
+		entryOff := 12 + i*csBlobIndexSize
+		if int(entryOff)+csBlobIndexSize > len(blob) {
+			return 0, false, errors.New("sip: code signature index out of bounds")
+		}
+		slotType := binary.BigEndian.Uint32(blob[entryOff : entryOff+4])
+		slotOffset := binary.BigEndian.Uint32(blob[entryOff+4 : entryOff+8])
+		if int(slotOffset) > len(blob) {
+			return 0, false, errors.New("sip: code signature slot offset out of bounds")
+		}
+		switch slotType {
+		case csSlotCodeDirectory:
+			flags, err = codeDirectoryFlags(blob[slotOffset:])
+			if err != nil {
+				return 0, false, err
+			}
+		case csSlotEntitlements:
+			if bytes.Contains(blob[slotOffset:], []byte(sipEntitlementAllowDyld)) {
+				hasDyldEnt = true
+			}
+		}
+	}
+	return flags, hasDyldEnt, nil
+}
+
+// codeDirectoryFlags reads the big-endian flags field (offset 12) of a
+// CodeDirectory blob (magic csMagicCodeDirectory).
+func codeDirectoryFlags(blob []byte) (uint32, error) {
+	if len(blob) < 16 {
+		return 0, errors.New("sip: code directory too small")
+	}
+	if magic := binary.BigEndian.Uint32(blob[0:4]); magic != csMagicCodeDirectory {
+		return 0, fmt.Errorf("sip: unexpected code directory magic %#x", magic)
+	}
+	return binary.BigEndian.Uint32(blob[12:16]), nil
+}
