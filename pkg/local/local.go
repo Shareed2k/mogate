@@ -193,12 +193,40 @@ func selectInjector(options injectionOptions, res sipResult) (string, error) {
 	return options.library, nil
 }
 
+// resolveExecutable resolves a bare command name to a concrete path via PATH,
+// mirroring what a shell (and exec.Command at spawn time) does. A name that
+// already contains a path separator is a path, not a PATH lookup, and is
+// returned unchanged. It exists so the darwin SIP-patch step opens the real
+// binary that would run, not a same-named file in the current directory.
+func resolveExecutable(name string) (string, error) {
+	if strings.ContainsRune(name, filepath.Separator) {
+		return name, nil
+	}
+	resolved, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve executable %q: %w", name, err)
+	}
+	return resolved, nil
+}
+
 // execute runs command with the injector loaded through the platform loader
-// variable. On macOS it first patches command[0] when it is a restricted system
-// binary, rewriting argv to run the patched copy (or the patched interpreter,
-// for a "#!" script) so DYLD_INSERT_LIBRARIES is honored. It returns a
-// descriptive error for a non-zero command exit.
+// variable. On macOS it first PATH-resolves a bare command[0] to the real
+// binary, then patches it when it is a restricted system binary, rewriting argv
+// to run the patched copy (or the patched interpreter, for a "#!" script) so
+// DYLD_INSERT_LIBRARIES is honored. It returns a descriptive error for a
+// non-zero command exit.
 func execute(ctx context.Context, options injectionOptions, command []string) error {
+	// On darwin the SIP-patch step below opens command[0] directly, so a bare
+	// name must first be resolved to the binary PATH would run. Off darwin
+	// exec.Command still resolves at spawn, so this is darwin-only and the
+	// non-darwin path stays byte-identical.
+	if runtime.GOOS == "darwin" {
+		resolved, err := resolveExecutable(command[0])
+		if err != nil {
+			return err
+		}
+		command[0] = resolved
+	}
 	res, err := patchIfRestricted(command[0])
 	if err != nil {
 		return err

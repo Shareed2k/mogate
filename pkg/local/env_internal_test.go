@@ -2,6 +2,7 @@ package local
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -24,6 +25,37 @@ func findEnv(env []string, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func TestResolveExecutable(t *testing.T) {
+	// A bare name found on PATH resolves to an absolute path, mirroring what a
+	// shell (and exec.Command) does at spawn time.
+	resolved, err := resolveExecutable("true")
+	if err != nil {
+		t.Fatalf("resolveExecutable(%q) unexpected error: %v", "true", err)
+	}
+	if !filepath.IsAbs(resolved) {
+		t.Fatalf("resolveExecutable(%q) = %q, want an absolute path", "true", resolved)
+	}
+
+	// A name that already contains a path separator is a path, not a PATH
+	// lookup, and is returned verbatim (never consulting PATH).
+	for _, name := range []string{"/usr/bin/true", "./x"} {
+		got, err := resolveExecutable(name)
+		if err != nil {
+			t.Fatalf("resolveExecutable(%q) unexpected error: %v", name, err)
+		}
+		if got != name {
+			t.Fatalf("resolveExecutable(%q) = %q, want it returned unchanged", name, got)
+		}
+	}
+
+	// A bare name that is not on PATH fails loud rather than resolving to a
+	// bogus or cwd-relative target.
+	const bogus = "definitely-not-a-real-binary-xyz"
+	if _, err := resolveExecutable(bogus); err == nil {
+		t.Fatalf("resolveExecutable(%q) error = nil, want a lookup failure", bogus)
+	}
 }
 
 func TestInjectedEnvironment_SetsLoaderAndSocket(t *testing.T) {
