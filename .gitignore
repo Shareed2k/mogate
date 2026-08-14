@@ -5,5 +5,8 @@
 *.so
 *.dylib
 *.h
+# injector/protocol_generated.h is generated (ignored above); sip_darwin.h is a
+# real source header and must be tracked.
+!injector/sip_darwin.h
 coverage.out
 .claude/

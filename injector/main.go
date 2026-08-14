@@ -30,6 +30,9 @@ package main
 #include <sys/uio.h>
 #include <unistd.h>
 #include "protocol_generated.h"
+#ifdef __APPLE__
+#include "sip_darwin.h"
+#endif
 
 #ifdef __APPLE__
 #include <sys/event.h>
