@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -106,6 +107,215 @@ func TestCSipPatch_NoPatch(t *testing.T) {
 	if res.err != "" {
 		t.Fatalf("mg_sip_patch(%q) set last error %q, want empty (no patch, not a failure)", plain, res.err)
 	}
+}
+
+const (
+	testSelf   = "/opt/mogate/libmogate.dylib"
+	testSocket = "/tmp/mogate-test.sock"
+)
+
+// envGet returns the value of key in a "KEY=value" slice, or "" plus false.
+func envGet(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix), true
+		}
+	}
+	return "", false
+}
+
+// assertInjectedEnv fails unless the recorded env re-asserts the injector's own
+// DYLD_INSERT_LIBRARIES and the relay MOGATE_SOCKET.
+func assertInjectedEnv(t *testing.T, env []string) {
+	t.Helper()
+	dyld, ok := envGet(env, "DYLD_INSERT_LIBRARIES")
+	if !ok {
+		t.Fatalf("recorded env is missing DYLD_INSERT_LIBRARIES: %v", env)
+	}
+	if !strings.Contains(dyld, testSelf) {
+		t.Errorf("DYLD_INSERT_LIBRARIES = %q, want it to list %q", dyld, testSelf)
+	}
+	if sock, ok := envGet(env, "MOGATE_SOCKET"); !ok || sock != testSocket {
+		t.Errorf("MOGATE_SOCKET = %q (present=%v), want %q", sock, ok, testSocket)
+	}
+}
+
+// TestCSipExecDetour_RestrictedPatched proves the execve detour rewrites the
+// target of a restricted binary to its patched cache copy while re-asserting the
+// injector's DYLD_INSERT_LIBRARIES. /usr/bin/true is universal (x86_64+arm64e),
+// so it is thinned and ad-hoc re-signed just like TestCSipPatch.
+func TestCSipExecDetour_RestrictedPatched(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/codesign"); err != nil {
+		t.Skip("codesign unavailable; the detour cannot patch a restricted binary")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want := filepath.Join(home, "Library", "Caches", "mogate", "sip", "v1", "usr", "bin", "true")
+
+	rec := sipExecveDetour("/usr/bin/true",
+		[]string{"/usr/bin/true", "--version"},
+		[]string{"PATH=/usr/bin", "HOME=" + home},
+		testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0 (spy reached)", rec.rc)
+	}
+	if rec.path != want {
+		t.Fatalf("exec path = %q, want the patched copy %q", rec.path, want)
+	}
+	// A non-script keeps its original argv unchanged.
+	if len(rec.argv) != 2 || rec.argv[0] != "/usr/bin/true" || rec.argv[1] != "--version" {
+		t.Errorf("argv = %v, want [/usr/bin/true --version]", rec.argv)
+	}
+	assertInjectedEnv(t, rec.env)
+}
+
+// TestCSipExecDetour_NonRestrictedOriginal proves a path that needs no patch is
+// exec'd unchanged, but the environment still carries the injector (re-added
+// here because the supplied env dropped both variables).
+func TestCSipExecDetour_NonRestrictedOriginal(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "plain")
+	if err := os.WriteFile(plain, []byte("not a mach-o\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := sipExecveDetour(plain,
+		[]string{plain, "arg"},
+		[]string{"PATH=/usr/bin"}, // no DYLD, no MOGATE_SOCKET
+		testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0", rec.rc)
+	}
+	if rec.path != plain {
+		t.Fatalf("exec path = %q, want the unchanged original %q", rec.path, plain)
+	}
+	assertInjectedEnv(t, rec.env)
+}
+
+// TestCSipExecDetour_PreservesExistingDyld proves that when the child env already
+// lists the injector in DYLD_INSERT_LIBRARIES, the detour does not duplicate it
+// and preserves any other entries the caller set.
+func TestCSipExecDetour_PreservesExistingDyld(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "plain")
+	if err := os.WriteFile(plain, []byte("not a mach-o\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := testSelf + ":/some/other.dylib"
+	rec := sipExecveDetour(plain,
+		[]string{plain},
+		[]string{"DYLD_INSERT_LIBRARIES=" + existing, "MOGATE_SOCKET=" + testSocket},
+		testSelf, testSocket)
+
+	dyld, ok := envGet(rec.env, "DYLD_INSERT_LIBRARIES")
+	if !ok {
+		t.Fatalf("missing DYLD_INSERT_LIBRARIES: %v", rec.env)
+	}
+	if dyld != existing {
+		t.Errorf("DYLD_INSERT_LIBRARIES = %q, want it left as %q (self already present)", dyld, existing)
+	}
+	if strings.Count(dyld, testSelf) != 1 {
+		t.Errorf("self %q duplicated in %q", testSelf, dyld)
+	}
+}
+
+// TestCSipExecDetour_Script proves a "#!" script is rewritten to run its
+// (patched) interpreter with argv [interp, shebangArgs..., scriptPath,
+// origArgv[1:]...]. The interpreter here is an ordinary file needing no patch,
+// so no codesign is required.
+func TestCSipExecDetour_Script(t *testing.T) {
+	dir := t.TempDir()
+	interp := filepath.Join(dir, "fakeinterp")
+	if err := os.WriteFile(interp, []byte("plain interpreter, not a mach-o\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "run.sh")
+	if err := os.WriteFile(script, []byte("#!"+interp+" -x -y\nbody\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := sipExecveDetour(script,
+		[]string{script, "A", "B"},
+		[]string{"PATH=/usr/bin"},
+		testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0", rec.rc)
+	}
+	if rec.path != interp {
+		t.Fatalf("exec path = %q, want the interpreter %q", rec.path, interp)
+	}
+	wantArgv := []string{interp, "-x", "-y", script, "A", "B"}
+	if !slices.Equal(rec.argv, wantArgv) {
+		t.Fatalf("argv = %v, want %v", rec.argv, wantArgv)
+	}
+	assertInjectedEnv(t, rec.env)
+}
+
+// TestCSipExecDetour_FailLoud proves the detour refuses to exec a target it
+// cannot resolve into an executable: a shebang whose interpreter does not exist
+// is a hard failure (mg_sip_patch sets a last-error), so the spy is never
+// reached and the detour returns -1.
+func TestCSipExecDetour_FailLoud(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "bad.sh")
+	if err := os.WriteFile(script, []byte("#!"+dir+"/does-not-exist\nbody\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := sipExecveDetour(script,
+		[]string{script},
+		[]string{"PATH=/usr/bin"},
+		testSelf, testSocket)
+
+	if rec.rc != -1 {
+		t.Fatalf("detour rc = %d, want -1 (fail-loud, spy not reached)", rec.rc)
+	}
+	if rec.path != "" {
+		t.Fatalf("spy recorded path %q, want it never called", rec.path)
+	}
+}
+
+// TestCSipExecDetour_ExecvpResolvesPath proves the execvp detour PATH-resolves a
+// bare command name before patching, and still injects the environment.
+func TestCSipExecDetour_ExecvpResolvesPath(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "mytool")
+	if err := os.WriteFile(tool, []byte("not a mach-o\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	rec := sipExecvpDetour("mytool", []string{"mytool", "-v"}, testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0", rec.rc)
+	}
+	if rec.path != tool {
+		t.Fatalf("exec path = %q, want PATH-resolved %q", rec.path, tool)
+	}
+	assertInjectedEnv(t, rec.env)
+}
+
+// TestCSipExecDetour_PosixSpawn proves the posix_spawn detour applies the same
+// patch + env rewrite as execve for a restricted binary.
+func TestCSipExecDetour_PosixSpawn(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/codesign"); err != nil {
+		t.Skip("codesign unavailable; the detour cannot patch a restricted binary")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want := filepath.Join(home, "Library", "Caches", "mogate", "sip", "v1", "usr", "bin", "true")
+
+	rec := sipPosixSpawnDetour("/usr/bin/true",
+		[]string{"/usr/bin/true"},
+		[]string{"PATH=/usr/bin", "HOME=" + home},
+		testSelf, testSocket)
+
+	if rec.rc != 0 {
+		t.Fatalf("detour rc = %d, want 0 (posix_spawn success)", rec.rc)
+	}
+	if rec.path != want {
+		t.Fatalf("spawn path = %q, want the patched copy %q", rec.path, want)
+	}
+	assertInjectedEnv(t, rec.env)
 }
 
 // assertAdhocSigned fails the test unless codesign reports path as ad-hoc signed.

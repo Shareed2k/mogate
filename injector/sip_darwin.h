@@ -562,21 +562,19 @@ static int mg_sip_is_space(char c) {
 		c == '\v' || c == '\f' || c == '\r';
 }
 
-// mg_sip_read_shebang reads the first line of the file at path and, when it is a
-// "#!interp [args...]" shebang, copies the interpreter token into out (capacity
-// out_cap, NUL-terminated) and returns 1. It returns 0 when the file is not a
-// shebang (no "#!" prefix, an empty file, or "#!" with no interpreter token) and
-// -1 on an I/O error or an interpreter too long for out. Mirrors readShebang;
-// only the interpreter is returned because the D1 exec detour re-derives argv.
-static int mg_sip_read_shebang(const char *path, char *out, size_t out_cap) {
+// mg_sip_read_shebang_line reads the first line of the file at path into buf
+// (capacity buf_cap; the caller sizes it, conventionally 8192 like readShebang's
+// scanner), stopping at the first newline, at EOF, or when buf fills. It sets
+// *out_got to the number of bytes read and returns 0 on success or -1 on an
+// open/read error. The buffer is not NUL-terminated; callers use *out_got.
+static int mg_sip_read_shebang_line(const char *path, char *buf, size_t buf_cap, size_t *out_got) {
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		return -1;
 	}
-	char buf[8192];
 	size_t got = 0;
-	while (got < sizeof(buf)) {
-		ssize_t n = read(fd, buf + got, sizeof(buf) - got);
+	while (got < buf_cap) {
+		ssize_t n = read(fd, buf + got, buf_cap - got);
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -593,7 +591,25 @@ static int mg_sip_read_shebang(const char *path, char *out, size_t out_cap) {
 		}
 	}
 	close(fd);
+	*out_got = got;
+	return 0;
+}
 
+// mg_sip_parse_shebang parses the first-line buffer buf[0..got) for a
+// "#!interp [args...]" shebang, mirroring Go's readShebang (which splits with
+// strings.Fields). On a shebang it copies the interpreter token into interp
+// (capacity interp_cap, NUL-terminated) and, when out_args is non-NULL, sets
+// *out_args to a freshly malloc'd NULL-terminated array of the remaining
+// whitespace-separated fields (a {NULL}-only array when there are none), which
+// the caller frees via mg_sip_free_strv. It returns 1 on a shebang, 0 when buf
+// is not a shebang (no "#!" prefix, empty, or "#!" with no interpreter token),
+// and -1 when the interpreter does not fit interp_cap or an allocation fails.
+// On a 0/-1 return *out_args is left NULL.
+static int mg_sip_parse_shebang(const char *buf, size_t got, char *interp,
+	size_t interp_cap, char ***out_args) {
+	if (out_args) {
+		*out_args = NULL;
+	}
 	if (got < 2 || buf[0] != '#' || buf[1] != '!') {
 		return 0; // not a shebang (covers Mach-O and other binaries)
 	}
@@ -614,12 +630,93 @@ static int mg_sip_read_shebang(const char *path, char *out, size_t out_cap) {
 	if (token == 0) {
 		return 0; // "#!" with no interpreter is not a shebang (readShebang ok=false)
 	}
-	if (token >= out_cap) {
+	if (token >= interp_cap) {
 		return -1; // interpreter path does not fit
 	}
-	memcpy(out, buf + start, token);
-	out[token] = 0;
+	memcpy(interp, buf + start, token);
+	interp[token] = 0;
+	if (!out_args) {
+		return 1;
+	}
+	// Tokenize the remaining fields exactly as strings.Fields would: two passes
+	// (count, then fill) over [i, line_len) splitting on whitespace runs.
+	size_t count = 0;
+	for (size_t j = i; j < line_len;) {
+		while (j < line_len && mg_sip_is_space(buf[j])) {
+			j++;
+		}
+		if (j >= line_len) {
+			break;
+		}
+		while (j < line_len && !mg_sip_is_space(buf[j])) {
+			j++;
+		}
+		count++;
+	}
+	char **args = (char **)malloc((count + 1) * sizeof(char *));
+	if (!args) {
+		return -1;
+	}
+	size_t w = 0;
+	for (size_t j = i; j < line_len && w < count;) {
+		while (j < line_len && mg_sip_is_space(buf[j])) {
+			j++;
+		}
+		if (j >= line_len) {
+			break;
+		}
+		size_t s = j;
+		while (j < line_len && !mg_sip_is_space(buf[j])) {
+			j++;
+		}
+		size_t tlen = j - s;
+		char *tok = (char *)malloc(tlen + 1);
+		if (!tok) {
+			for (size_t k = 0; k < w; k++) {
+				free(args[k]);
+			}
+			free(args);
+			return -1;
+		}
+		memcpy(tok, buf + s, tlen);
+		tok[tlen] = 0;
+		args[w++] = tok;
+	}
+	args[w] = NULL;
+	*out_args = args;
 	return 1;
+}
+
+// mg_sip_read_shebang reads the first line of the file at path and, when it is a
+// "#!interp [args...]" shebang, copies the interpreter token into out (capacity
+// out_cap, NUL-terminated) and returns 1. It returns 0 when the file is not a
+// shebang (no "#!" prefix, an empty file, or "#!" with no interpreter token) and
+// -1 on an I/O error or an interpreter too long for out. Mirrors readShebang;
+// mg_sip_patch uses only the interpreter, so the argument fields are discarded.
+static int mg_sip_read_shebang(const char *path, char *out, size_t out_cap) {
+	char buf[8192];
+	size_t got = 0;
+	if (mg_sip_read_shebang_line(path, buf, sizeof(buf), &got) != 0) {
+		return -1;
+	}
+	return mg_sip_parse_shebang(buf, got, out, out_cap, NULL);
+}
+
+// mg_sip_read_shebang_fields is mg_sip_read_shebang plus the shebang's argument
+// fields: on a shebang it returns 1 with *out_args set to a malloc'd
+// NULL-terminated array (freed via mg_sip_free_strv); the D1 exec detour rebuilds
+// a script's argv as [interp, args..., scriptPath, origArgv[1:]...].
+static int mg_sip_read_shebang_fields(const char *path, char *interp,
+	size_t interp_cap, char ***out_args) {
+	char buf[8192];
+	size_t got = 0;
+	if (out_args) {
+		*out_args = NULL;
+	}
+	if (mg_sip_read_shebang_line(path, buf, sizeof(buf), &got) != 0) {
+		return -1;
+	}
+	return mg_sip_parse_shebang(buf, got, interp, interp_cap, out_args);
 }
 
 // mg_sip_lexical_clean returns a freshly malloc'd, lexically cleaned copy of
@@ -984,6 +1081,484 @@ fail:
 	free(data);
 	free(cache);
 	return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// D1: exec-family detours.
+//
+// When an injected process spawns a child, the child must itself keep the
+// injection: its executable is SIP-patched (so dyld honors
+// DYLD_INSERT_LIBRARIES for it) and its environment retains
+// DYLD_INSERT_LIBRARIES=<injector> and MOGATE_SOCKET=<socket> so the injector
+// re-loads and re-connects the child. The substantive logic lives here as
+// static functions so the two-TU cgo bridge can test it without replacing the
+// process; injector/main.go's mg_execve_hook / mg_posix_spawn_hook etc. are thin
+// interpose wrappers that pass in the resolved real exec function (the test
+// passes a recording spy). Everything is __APPLE__-only: exec is not SIP-hooked
+// on linux, which has no System Integrity Protection.
+// ---------------------------------------------------------------------------
+
+// Upper bounds guarding argv/envp construction against a hostile or corrupt
+// caller: neither a shebang line's fields nor an environment realistically
+// approaches these, and they keep the count/size math below from overflowing.
+#define MG_SIP_MAX_ARGS 65536u
+#define MG_SIP_MAX_ENV 262144u
+
+// mg_sip_free_strv frees a malloc'd NULL-terminated array of malloc'd strings
+// (used for both the fixed envp and a shebang's argument fields).
+static void mg_sip_free_strv(char **v) {
+	if (!v) {
+		return;
+	}
+	for (size_t i = 0; v[i]; i++) {
+		free(v[i]);
+	}
+	free(v);
+}
+
+// mg_sip_join2 returns a freshly malloc'd concatenation prefix+value, or NULL on
+// allocation failure. Used to build "KEY=value" environment entries.
+static char *mg_sip_join2(const char *prefix, const char *value) {
+	size_t pl = strlen(prefix);
+	size_t vl = strlen(value);
+	char *out = (char *)malloc(pl + vl + 1);
+	if (!out) {
+		return NULL;
+	}
+	memcpy(out, prefix, pl);
+	memcpy(out + pl, value, vl);
+	out[pl + vl] = 0;
+	return out;
+}
+
+// mg_sip_pathlist_has reports whether the ':'-delimited list contains elem as an
+// exact element, so re-adding the injector to DYLD_INSERT_LIBRARIES does not
+// duplicate a path a child already inherited.
+static int mg_sip_pathlist_has(const char *list, const char *elem) {
+	size_t el = strlen(elem);
+	if (el == 0) {
+		return 1;
+	}
+	const char *p = list;
+	for (;;) {
+		const char *colon = strchr(p, ':');
+		size_t seg = colon ? (size_t)(colon - p) : strlen(p);
+		if (seg == el && memcmp(p, elem, el) == 0) {
+			return 1;
+		}
+		if (!colon) {
+			break;
+		}
+		p = colon + 1;
+	}
+	return 0;
+}
+
+// mg_sip_dyld_entry returns a malloc'd "DYLD_INSERT_LIBRARIES=" entry that is
+// guaranteed to list self: existing is kept unchanged when it already contains
+// self, otherwise self is prepended (self alone when existing is empty). Prepend
+// order mirrors Go's injectedEnvironment (the injector's own path first). Returns
+// NULL on allocation failure.
+static char *mg_sip_dyld_entry(const char *existing, const char *self) {
+	static const char pfx[] = "DYLD_INSERT_LIBRARIES=";
+	size_t pl = sizeof(pfx) - 1;
+	if (!existing || !*existing) {
+		return mg_sip_join2(pfx, self);
+	}
+	if (mg_sip_pathlist_has(existing, self)) {
+		return mg_sip_join2(pfx, existing);
+	}
+	size_t sl = strlen(self);
+	size_t el = strlen(existing);
+	char *out = (char *)malloc(pl + sl + 1 + el + 1);
+	if (!out) {
+		return NULL;
+	}
+	memcpy(out, pfx, pl);
+	memcpy(out + pl, self, sl);
+	out[pl + sl] = ':';
+	memcpy(out + pl + sl + 1, existing, el);
+	out[pl + sl + 1 + el] = 0;
+	return out;
+}
+
+// mg_sip_fix_env returns a freshly malloc'd, NULL-terminated environment that is
+// a copy of envp with DYLD_INSERT_LIBRARIES ensured to list self (self may be
+// NULL to skip) and MOGATE_SOCKET set to socket (socket may be NULL to skip),
+// re-adding either if a caller dropped it. It replaces an existing
+// MOGATE_SOCKET and augments an existing DYLD_INSERT_LIBRARIES in place so their
+// position is preserved. Returns NULL on allocation failure; the caller frees
+// via mg_sip_free_strv.
+static char **mg_sip_fix_env(char *const envp[], const char *self, const char *socket) {
+	static const char dyld_pfx[] = "DYLD_INSERT_LIBRARIES=";
+	static const char sock_pfx[] = "MOGATE_SOCKET=";
+	size_t n = 0;
+	if (envp) {
+		while (envp[n]) {
+			if (n >= MG_SIP_MAX_ENV) {
+				return NULL;
+			}
+			n++;
+		}
+	}
+	// n entries + up to 2 appended (DYLD, MOGATE_SOCKET) + NULL terminator.
+	char **out = (char **)calloc(n + 3, sizeof(char *));
+	if (!out) {
+		return NULL;
+	}
+	size_t w = 0;
+	int dyld_done = 0;
+	int sock_done = 0;
+	for (size_t i = 0; i < n; i++) {
+		const char *e = envp[i];
+		char *repl;
+		if (self && strncmp(e, dyld_pfx, sizeof(dyld_pfx) - 1) == 0) {
+			repl = mg_sip_dyld_entry(e + sizeof(dyld_pfx) - 1, self);
+			dyld_done = 1;
+		} else if (socket && strncmp(e, sock_pfx, sizeof(sock_pfx) - 1) == 0) {
+			repl = mg_sip_join2(sock_pfx, socket);
+			sock_done = 1;
+		} else {
+			repl = strdup(e);
+		}
+		if (!repl) {
+			goto oom;
+		}
+		out[w++] = repl;
+	}
+	if (self && !dyld_done) {
+		char *v = mg_sip_dyld_entry(NULL, self);
+		if (!v) {
+			goto oom;
+		}
+		out[w++] = v;
+	}
+	if (socket && !sock_done) {
+		char *v = mg_sip_join2(sock_pfx, socket);
+		if (!v) {
+			goto oom;
+		}
+		out[w++] = v;
+	}
+	out[w] = NULL;
+	return out;
+oom:
+	mg_sip_free_strv(out);
+	return NULL;
+}
+
+// mg_sip_path_search resolves a bare command name (no '/') against $PATH the way
+// execvp / posix_spawnp do, writing the first executable regular-file match into
+// out (capacity out_cap) and returning 1, or returning 0 when nothing matches or
+// a candidate does not fit out. An empty PATH element means the current
+// directory, and an unset/empty $PATH falls back to _CS_PATH (typically
+// "/usr/bin:/bin").
+static int mg_sip_path_search(const char *file, char *out, size_t out_cap) {
+	if (!file || !*file) {
+		return 0;
+	}
+	char defpath[PATH_MAX];
+	const char *path = getenv("PATH");
+	if (!path || !*path) {
+		size_t got = confstr(_CS_PATH, defpath, sizeof(defpath));
+		path = (got > 0 && got <= sizeof(defpath)) ? defpath : "/usr/bin:/bin";
+	}
+	size_t flen = strlen(file);
+	const char *p = path;
+	for (;;) {
+		const char *colon = strchr(p, ':');
+		const char *dir = p;
+		size_t dlen = colon ? (size_t)(colon - p) : strlen(p);
+		if (dlen == 0) {
+			dir = "."; // an empty PATH element means the current directory
+			dlen = 1;
+		}
+		if (dlen + 1 + flen + 1 <= out_cap) {
+			memcpy(out, dir, dlen);
+			out[dlen] = '/';
+			memcpy(out + dlen + 1, file, flen);
+			out[dlen + 1 + flen] = 0;
+			struct stat st;
+			if (access(out, X_OK) == 0 && stat(out, &st) == 0 && S_ISREG(st.st_mode)) {
+				return 1;
+			}
+		}
+		if (!colon) {
+			break;
+		}
+		p = colon + 1;
+	}
+	return 0;
+}
+
+// mg_sip_exec_target is the resolved plan for exec'ing a path: the executable to
+// actually run (path), whether the input was a "#!" script (and if so the
+// original script path plus its shebang argument fields, so the detour can
+// rebuild argv), and an error flag for a hard patch failure the detour must turn
+// into a failed exec. All non-NULL pointer members are malloc'd; free via
+// mg_sip_exec_target_free.
+typedef struct {
+	char *path;
+	int error;
+	int is_script;
+	char *script_path;
+	char **script_args;
+} mg_sip_exec_target;
+
+// mg_sip_exec_target_free releases every owned member of a target and zeroes it.
+static void mg_sip_exec_target_free(mg_sip_exec_target *t) {
+	if (!t) {
+		return;
+	}
+	free(t->path);
+	free(t->script_path);
+	mg_sip_free_strv(t->script_args);
+	t->path = NULL;
+	t->script_path = NULL;
+	t->script_args = NULL;
+}
+
+// mg_sip_resolve_exec builds the exec plan for resolved (an already
+// PATH-resolved path). It reads a leading shebang and, for a script, patches the
+// interpreter and records the shebang args + original path; for a plain binary
+// it patches the binary. Fail-loud: a hard mg_sip_patch failure (NULL with a
+// non-empty mg_sip_last_error) sets out->error so the detour refuses to exec an
+// un-patched binary that needed patching. A path that is not a readable regular
+// file (missing, a directory, a device) is passed through un-patched so the real
+// exec reports the true errno (ENOENT/EACCES/...) rather than a synthetic one.
+static void mg_sip_resolve_exec(const char *resolved, mg_sip_exec_target *out) {
+	memset(out, 0, sizeof(*out));
+	if (!resolved) {
+		mg_sip_set_error("sip: null exec path");
+		out->error = 1;
+		return;
+	}
+	struct stat st;
+	if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
+		out->path = strdup(resolved);
+		if (!out->path) {
+			mg_sip_set_error("sip: out of memory");
+			out->error = 1;
+		}
+		return;
+	}
+
+	char interp[PATH_MAX];
+	char **args = NULL;
+	int sb = mg_sip_read_shebang_fields(resolved, interp, sizeof(interp), &args);
+	if (sb < 0) {
+		mg_sip_set_error("sip: read shebang");
+		out->error = 1;
+		return;
+	}
+	if (sb == 1) {
+		char *patched = mg_sip_patch(interp);
+		if (!patched) {
+			if (mg_sip_last_error()[0] != '\0') {
+				mg_sip_free_strv(args);
+				out->error = 1;
+				return;
+			}
+			patched = strdup(interp); // interpreter needs no patch: run it as-is
+			if (!patched) {
+				mg_sip_free_strv(args);
+				mg_sip_set_error("sip: out of memory");
+				out->error = 1;
+				return;
+			}
+		}
+		char *script_path = strdup(resolved);
+		if (!script_path) {
+			free(patched);
+			mg_sip_free_strv(args);
+			mg_sip_set_error("sip: out of memory");
+			out->error = 1;
+			return;
+		}
+		out->path = patched;
+		out->is_script = 1;
+		out->script_path = script_path;
+		out->script_args = args;
+		return;
+	}
+
+	// Not a script: patch the binary itself.
+	char *patched = mg_sip_patch(resolved);
+	if (!patched) {
+		if (mg_sip_last_error()[0] != '\0') {
+			out->error = 1;
+			return;
+		}
+		patched = strdup(resolved); // binary needs no patch: run it as-is
+		if (!patched) {
+			mg_sip_set_error("sip: out of memory");
+			out->error = 1;
+		}
+	}
+	out->path = patched;
+}
+
+// mg_sip_build_script_argv builds a child argv for a shebang script:
+// [interp, shebang args..., scriptPath, origArgv[1:]...]. The returned array
+// holds borrowed pointers into t and orig_argv, so the caller frees only the
+// array (not its elements). Returns NULL on allocation failure or an argv longer
+// than MG_SIP_MAX_ARGS.
+static char **mg_sip_build_script_argv(const mg_sip_exec_target *t, char *const orig_argv[]) {
+	size_t oc = 0;
+	if (orig_argv) {
+		while (orig_argv[oc]) {
+			if (oc >= MG_SIP_MAX_ARGS) {
+				return NULL;
+			}
+			oc++;
+		}
+	}
+	size_t ac = 0;
+	while (t->script_args[ac]) {
+		if (ac >= MG_SIP_MAX_ARGS) {
+			return NULL;
+		}
+		ac++;
+	}
+	size_t tail = (oc > 0) ? (oc - 1) : 0; // original argv without argv[0]
+	size_t total = 1 + ac + 1 + tail; // interp + shebang args + script path + tail
+	char **out = (char **)malloc((total + 1) * sizeof(char *));
+	if (!out) {
+		return NULL;
+	}
+	size_t w = 0;
+	out[w++] = t->path;
+	for (size_t i = 0; i < ac; i++) {
+		out[w++] = t->script_args[i];
+	}
+	out[w++] = t->script_path;
+	for (size_t i = 1; i < oc; i++) {
+		out[w++] = orig_argv[i];
+	}
+	out[w] = NULL;
+	return out;
+}
+
+// Real exec-family function types the detours ultimately call (the injector's
+// resolved libSystem symbol, or the test spy). posix_spawn and posix_spawnp
+// share a signature.
+typedef int (*mg_sip_execve_fn)(const char *, char *const[], char *const[]);
+typedef int (*mg_sip_execvp_fn)(const char *, char *const[]);
+typedef int (*mg_sip_spawn_fn)(pid_t *, const char *,
+	const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
+	char *const[], char *const[]);
+
+// mg_sip_execve_detour is the core execve/execvp path: resolve the exec plan for
+// path, build a DYLD/MOGATE_SOCKET-preserving envp, rebuild argv for a script,
+// and call real. On a hard patch failure it sets errno=ENOEXEC and returns -1
+// without calling real (fail-loud). real is only reached on an execve error, so
+// the frees below run on failure; on success the image is replaced.
+static int mg_sip_execve_detour(const char *path, char *const argv[], char *const envp[],
+	const char *self, const char *socket, mg_sip_execve_fn real) {
+	mg_sip_exec_target target;
+	mg_sip_resolve_exec(path, &target);
+	if (target.error) {
+		mg_sip_exec_target_free(&target);
+		errno = ENOEXEC;
+		return -1;
+	}
+	char **new_env = mg_sip_fix_env(envp, self, socket);
+	if (!new_env) {
+		mg_sip_exec_target_free(&target);
+		errno = ENOMEM;
+		return -1;
+	}
+	int rc;
+	int saved;
+	if (target.is_script) {
+		char **new_argv = mg_sip_build_script_argv(&target, argv);
+		if (!new_argv) {
+			mg_sip_free_strv(new_env);
+			mg_sip_exec_target_free(&target);
+			errno = ENOMEM;
+			return -1;
+		}
+		rc = real(target.path, new_argv, new_env);
+		saved = errno;
+		free(new_argv);
+	} else {
+		rc = real(target.path, argv, new_env);
+		saved = errno;
+	}
+	mg_sip_free_strv(new_env);
+	mg_sip_exec_target_free(&target);
+	errno = saved;
+	return rc;
+}
+
+// mg_sip_posix_spawn_detour is the core posix_spawn/posix_spawnp path. Unlike
+// execve, posix_spawn returns (the child runs concurrently), so it always frees
+// the built envp/argv on return and reports errors via its return value (an
+// errno) rather than the errno global. A NULL envp means "use the current
+// environment", matching a common caller convention.
+static int mg_sip_posix_spawn_detour(pid_t *pid, const char *path,
+	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+	char *const argv[], char *const envp[],
+	const char *self, const char *socket, mg_sip_spawn_fn real) {
+	mg_sip_exec_target target;
+	mg_sip_resolve_exec(path, &target);
+	if (target.error) {
+		mg_sip_exec_target_free(&target);
+		return ENOEXEC;
+	}
+	char *const *base = envp ? envp : (char *const *)*_NSGetEnviron();
+	char **new_env = mg_sip_fix_env(base, self, socket);
+	if (!new_env) {
+		mg_sip_exec_target_free(&target);
+		return ENOMEM;
+	}
+	int rc;
+	if (target.is_script) {
+		char **new_argv = mg_sip_build_script_argv(&target, argv);
+		if (!new_argv) {
+			mg_sip_free_strv(new_env);
+			mg_sip_exec_target_free(&target);
+			return ENOMEM;
+		}
+		rc = real(pid, target.path, fa, attr, new_argv, new_env);
+		free(new_argv);
+	} else {
+		rc = real(pid, target.path, fa, attr, argv, new_env);
+	}
+	mg_sip_free_strv(new_env);
+	mg_sip_exec_target_free(&target);
+	return rc;
+}
+
+// mg_sip_execvp_detour PATH-resolves a bare file name (execvp semantics) then
+// runs the execve detour over the current environment. When PATH resolution
+// finds nothing the bare name is passed through, so the real execve reports the
+// same not-found error the caller would otherwise see.
+static int mg_sip_execvp_detour(const char *file, char *const argv[],
+	const char *self, const char *socket, mg_sip_execve_fn real) {
+	char resolved[PATH_MAX];
+	const char *target = file;
+	if (file && !strchr(file, '/') && mg_sip_path_search(file, resolved, sizeof(resolved)) == 1) {
+		target = resolved;
+	}
+	char *const *env = (char *const *)*_NSGetEnviron();
+	return mg_sip_execve_detour(target, argv, env, self, socket, real);
+}
+
+// mg_sip_posix_spawnp_detour PATH-resolves a bare file name (posix_spawnp
+// semantics) then runs the posix_spawn detour. real is a real posix_spawn: a
+// resolved absolute target needs no further search, and an unresolved bare name
+// is passed through to fail identically to the caller's expectation.
+static int mg_sip_posix_spawnp_detour(pid_t *pid, const char *file,
+	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+	char *const argv[], char *const envp[],
+	const char *self, const char *socket, mg_sip_spawn_fn real) {
+	char resolved[PATH_MAX];
+	const char *target = file;
+	if (file && !strchr(file, '/') && mg_sip_path_search(file, resolved, sizeof(resolved)) == 1) {
+		target = resolved;
+	}
+	return mg_sip_posix_spawn_detour(pid, target, fa, attr, argv, envp, self, socket, real);
 }
 
 #endif // __APPLE__
