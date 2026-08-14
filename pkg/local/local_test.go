@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,23 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Fatal("condition not met before deadline")
 }
 
+// skipInjectedSpawnOnDarwin skips a test that spawns a live command with the
+// injector loaded. On macOS, execute() patches a restricted top-level binary
+// and DYLD-injects the loader, so the child actually runs under the injector:
+// a placeholder injector library gets the process killed by dyld/AMFI, and the
+// only binary that survives the loader variable — an unpatched SIP-restricted
+// one such as /bin/sh — has DYLD_* stripped by SIP, so the injection never
+// takes effect. Exercising a surviving injected spawn therefore needs a real
+// built injector, which lives in the E2E/golden phases. The platform-agnostic
+// relay/drain flow still runs on Linux, and the loader variable and arch-aware
+// injector selection are covered by the internal unit tests.
+func skipInjectedSpawnOnDarwin(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("live injected spawn requires a real built injector on macOS; covered by E2E, not this unit test")
+	}
+}
+
 // socketReady reports whether path is a Unix socket.
 func socketReady(path string) bool {
 	info, err := os.Stat(path)
@@ -87,6 +105,7 @@ func socketReady(path string) bool {
 // DYLD_* loader variable from protected binaries such as /bin/sh, so the loader
 // variable itself is verified authoritatively by the internal unit test).
 func TestRun_InjectsAndDrains(t *testing.T) {
+	skipInjectedSpawnOnDarwin(t)
 	defer goleak.VerifyNone(t)
 
 	dir := t.TempDir()
@@ -151,6 +170,7 @@ func TestRun_InjectsAndDrains(t *testing.T) {
 // TestRun_CancelReturnsPromptly asserts that cancelling ctx drains a running
 // session promptly and leaves no goroutine behind.
 func TestRun_CancelReturnsPromptly(t *testing.T) {
+	skipInjectedSpawnOnDarwin(t)
 	defer goleak.VerifyNone(t)
 
 	dir := t.TempDir()

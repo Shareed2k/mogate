@@ -44,6 +44,11 @@ type Config struct {
 	// InjectorLib is the path to the injector .so/.dylib loaded through
 	// LD_PRELOAD (Linux) or DYLD_INSERT_LIBRARIES (macOS).
 	InjectorLib string
+	// InjectorLibRosetta is the path to the x86_64 build of the injector,
+	// loaded for a command thinned to its x86_64 slice that runs under Rosetta.
+	// It is required on Apple Silicon for restricted system binaries; on other
+	// platforms it is unused.
+	InjectorLibRosetta string
 	// Root is the filesystem root offered to remote file operations. An empty
 	// root disables file redirection.
 	Root string
@@ -139,9 +144,10 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 	}
 	tasks = append(tasks, session.Task{Name: "command", Run: func(taskCtx context.Context) error {
 		return execute(taskCtx, injectionOptions{
-			socket:  cfg.Socket,
-			library: cfg.InjectorLib,
-			files:   cfg.Modes.Files && cfg.Root != "",
+			socket:         cfg.Socket,
+			library:        cfg.InjectorLib,
+			libraryRosetta: cfg.InjectorLibRosetta,
+			files:          cfg.Modes.Files && cfg.Root != "",
 		}, command)
 	}})
 	return session.Run(runCtx, tasks...)
@@ -167,15 +173,52 @@ func readToken(path string) (string, error) {
 
 // injectionOptions configures how the injector is loaded into a command.
 type injectionOptions struct {
-	socket  string
-	library string
-	files   bool
+	socket         string
+	library        string
+	libraryRosetta string
+	files          bool
+}
+
+// selectInjector picks the injector matching the slice command[0] was thinned
+// to. A binary run natively (or any platform without SIP patching) takes the
+// primary library; one thinned to x86_64 under Rosetta takes the x86_64
+// library, and it is fail-loud when that path was not configured.
+func selectInjector(options injectionOptions, res sipResult) (string, error) {
+	if res.arch == sipArchRosetta {
+		if options.libraryRosetta == "" {
+			return "", fmt.Errorf("sip: %s needs the x86_64 injector but InjectorLibRosetta is unset", res.path)
+		}
+		return options.libraryRosetta, nil
+	}
+	return options.library, nil
 }
 
 // execute runs command with the injector loaded through the platform loader
-// variable. It returns a descriptive error for a non-zero command exit.
+// variable. On macOS it first patches command[0] when it is a restricted system
+// binary, rewriting argv to run the patched copy (or the patched interpreter,
+// for a "#!" script) so DYLD_INSERT_LIBRARIES is honored. It returns a
+// descriptive error for a non-zero command exit.
 func execute(ctx context.Context, options injectionOptions, command []string) error {
-	library, err := filepath.Abs(options.library)
+	res, err := patchIfRestricted(command[0])
+	if err != nil {
+		return err
+	}
+	if res.scriptInterp != "" {
+		rebuilt := make([]string, 0, 1+len(res.scriptArgs)+len(command))
+		rebuilt = append(rebuilt, res.scriptInterp)
+		rebuilt = append(rebuilt, res.scriptArgs...)
+		rebuilt = append(rebuilt, command[0])
+		rebuilt = append(rebuilt, command[1:]...)
+		command = rebuilt
+	} else {
+		command[0] = res.path
+	}
+
+	lib, err := selectInjector(options, res)
+	if err != nil {
+		return err
+	}
+	library, err := filepath.Abs(lib)
 	if err != nil {
 		return fmt.Errorf("resolve injector path: %w", err)
 	}
