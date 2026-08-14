@@ -15,15 +15,20 @@
 
 #ifdef __APPLE__
 
+#include <crt_externs.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <spawn.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // Constants mirror pkg/local/sip_darwin.go exactly. They are re-declared here
@@ -62,6 +67,11 @@
 // carrying it is not treated as needing a patch.
 static const char MG_SIP_ENT_ALLOW_DYLD[] =
 	"com.apple.security.cs.allow-dyld-environment-variables";
+
+// The on-disk patch-cache version, mirrored from pkg/local/sip.go's
+// sipCacheVersion. Namespacing the cache by it re-patches every entry at once on
+// a mogate upgrade. Task E1 asserts the C and Go cache paths agree exactly.
+static const char MG_SIP_CACHE_VERSION[] = "v1";
 
 static uint32_t mg_sip_be32(const uint8_t *p) {
 	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -513,6 +523,467 @@ static int mg_sip_needs_patch(const char *path) {
 	int restricted = restricted_flag ||
 		(cs_flags & (MG_SIP_CS_RESTRICT | MG_SIP_CS_RUNTIME)) != 0;
 	return (restricted && !has_dyld) ? 1 : 0;
+}
+
+// mg_sip_error holds the last unrecoverable error from mg_sip_patch. It is
+// thread-local so one thread of a multi-threaded target cannot observe another
+// thread's error, and (like every symbol here) static, so each translation unit
+// that includes this header gets its own copy. mg_sip_patch clears it on entry
+// so the D1 exec detour can tell its three outcomes apart: a non-NULL return is
+// the patched path; NULL with an empty last-error means "no patch needed" (run
+// the original); NULL with a non-empty last-error is a hard failure the detour
+// turns into a failed exec.
+static __thread char mg_sip_error[512];
+
+// mg_sip_last_error returns the current thread's last error string, or an empty
+// string when the last mg_sip_patch call needed no patch or succeeded. The
+// pointer is owned by the thread-local buffer: the caller must not free it and
+// should copy it before the next mg_sip_patch call.
+static const char *mg_sip_last_error(void) {
+	return mg_sip_error;
+}
+
+// mg_sip_set_error records msg as the current thread's last error, truncating to
+// the fixed buffer (the string is diagnostic, not load-bearing).
+static void mg_sip_set_error(const char *msg) {
+	size_t n = strlen(msg);
+	if (n >= sizeof(mg_sip_error)) {
+		n = sizeof(mg_sip_error) - 1;
+	}
+	memcpy(mg_sip_error, msg, n);
+	mg_sip_error[n] = 0;
+}
+
+// mg_sip_is_space reports whether c is one of the ASCII whitespace characters
+// unicode.IsSpace recognizes, so the shebang tokenizer splits exactly where
+// Go's strings.Fields would.
+static int mg_sip_is_space(char c) {
+	return c == ' ' || c == '\t' || c == '\n' ||
+		c == '\v' || c == '\f' || c == '\r';
+}
+
+// mg_sip_read_shebang reads the first line of the file at path and, when it is a
+// "#!interp [args...]" shebang, copies the interpreter token into out (capacity
+// out_cap, NUL-terminated) and returns 1. It returns 0 when the file is not a
+// shebang (no "#!" prefix, an empty file, or "#!" with no interpreter token) and
+// -1 on an I/O error or an interpreter too long for out. Mirrors readShebang;
+// only the interpreter is returned because the D1 exec detour re-derives argv.
+static int mg_sip_read_shebang(const char *path, char *out, size_t out_cap) {
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return -1;
+	}
+	char buf[8192];
+	size_t got = 0;
+	while (got < sizeof(buf)) {
+		ssize_t n = read(fd, buf + got, sizeof(buf) - got);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			close(fd);
+			return -1;
+		}
+		if (n == 0) {
+			break; // EOF before a newline
+		}
+		got += (size_t)n;
+		if (memchr(buf, '\n', got) != NULL) {
+			break;
+		}
+	}
+	close(fd);
+
+	if (got < 2 || buf[0] != '#' || buf[1] != '!') {
+		return 0; // not a shebang (covers Mach-O and other binaries)
+	}
+	size_t line_len = got;
+	const char *nl = (const char *)memchr(buf, '\n', got);
+	if (nl != NULL) {
+		line_len = (size_t)(nl - buf);
+	}
+	size_t i = 2;
+	while (i < line_len && mg_sip_is_space(buf[i])) {
+		i++;
+	}
+	size_t start = i;
+	while (i < line_len && !mg_sip_is_space(buf[i])) {
+		i++;
+	}
+	size_t token = i - start;
+	if (token == 0) {
+		return 0; // "#!" with no interpreter is not a shebang (readShebang ok=false)
+	}
+	if (token >= out_cap) {
+		return -1; // interpreter path does not fit
+	}
+	memcpy(out, buf + start, token);
+	out[token] = 0;
+	return 1;
+}
+
+// mg_sip_lexical_clean returns a freshly malloc'd, lexically cleaned copy of
+// path (collapsing "." / ".." / redundant separators without touching the
+// filesystem), mirroring Go's path/filepath.Clean so the cache path matches the
+// Go port byte-for-byte. The caller owns the result.
+static char *mg_sip_lexical_clean(const char *path) {
+	size_t n = strlen(path);
+	char *out = (char *)malloc(n + 2);
+	if (!out) {
+		return NULL;
+	}
+	if (n == 0) {
+		out[0] = '.';
+		out[1] = 0;
+		return out;
+	}
+	int rooted = path[0] == '/';
+	size_t w = 0;
+	size_t r = 0;
+	size_t dotdot = 0;
+	if (rooted) {
+		out[w++] = '/';
+		r = 1;
+		dotdot = 1;
+	}
+	while (r < n) {
+		if (path[r] == '/') {
+			r++;
+		} else if (path[r] == '.' && (r + 1 == n || path[r + 1] == '/')) {
+			r++;
+		} else if (path[r] == '.' && path[r + 1] == '.' &&
+			(r + 2 == n || path[r + 2] == '/')) {
+			r += 2;
+			if (w > dotdot) {
+				w--;
+				while (w > dotdot && out[w - 1] != '/') {
+					w--;
+				}
+			} else if (!rooted) {
+				if (w > 0) {
+					out[w++] = '/';
+				}
+				out[w++] = '.';
+				out[w++] = '.';
+				dotdot = w;
+			}
+		} else {
+			if ((rooted && w != 1) || (!rooted && w != 0)) {
+				out[w++] = '/';
+			}
+			while (r < n && path[r] != '/') {
+				out[w++] = path[r++];
+			}
+		}
+	}
+	if (w == 0) {
+		out[w++] = '.';
+	}
+	out[w] = 0;
+	return out;
+}
+
+// mg_sip_abs_clean returns a freshly malloc'd absolute, lexically cleaned copy of
+// path: a relative path is joined onto the current working directory first,
+// mirroring Go's filepath.Abs. The caller owns the result; NULL on error.
+static char *mg_sip_abs_clean(const char *path) {
+	if (path[0] == '/') {
+		return mg_sip_lexical_clean(path);
+	}
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd))) {
+		return NULL;
+	}
+	size_t need = strlen(cwd) + 1 + strlen(path) + 1;
+	char *joined = (char *)malloc(need);
+	if (!joined) {
+		return NULL;
+	}
+	snprintf(joined, need, "%s/%s", cwd, path);
+	char *cleaned = mg_sip_lexical_clean(joined);
+	free(joined);
+	return cleaned;
+}
+
+// mg_sip_cache_path returns the on-disk cache path for the patched copy of path:
+// <HOME>/Library/Caches/mogate/sip/<MG_SIP_CACHE_VERSION>/<abs(path) without its
+// leading '/'>. It mirrors pkg/local/sip.go's sipCachePath (os.UserCacheDir on
+// darwin is $HOME/Library/Caches); the assembled path is lexically cleaned so it
+// matches Go's filepath.Join. Returns a malloc'd string the caller owns, or NULL.
+static char *mg_sip_cache_path(const char *path) {
+	const char *home = getenv("HOME");
+	if (!home || !*home) {
+		return NULL;
+	}
+	char *cleaned = mg_sip_abs_clean(path);
+	if (!cleaned) {
+		return NULL;
+	}
+	const char *rel = cleaned;
+	if (rel[0] == '/') {
+		rel++; // TrimPrefix a single leading separator, like the Go port
+	}
+	static const char mid[] = "/Library/Caches/mogate/sip/";
+	size_t need = strlen(home) + (sizeof(mid) - 1) +
+		(sizeof(MG_SIP_CACHE_VERSION) - 1) + 1 + strlen(rel) + 1;
+	char *joined = (char *)malloc(need);
+	if (!joined) {
+		free(cleaned);
+		return NULL;
+	}
+	snprintf(joined, need, "%s%s%s/%s", home, mid, MG_SIP_CACHE_VERSION, rel);
+	free(cleaned);
+	char *out = mg_sip_lexical_clean(joined);
+	free(joined);
+	return out;
+}
+
+// mg_sip_mkdir_parents creates dir and every missing parent with mode 0700,
+// mirroring os.MkdirAll(dir, 0700). It temporarily rewrites separators in dir to
+// NUL while walking the components and restores them before returning. Returns 0
+// on success (including when a component already exists) and -1 otherwise.
+static int mg_sip_mkdir_parents(char *dir) {
+	for (char *p = dir + 1; *p; p++) {
+		if (*p == '/') {
+			*p = 0;
+			int rc = mkdir(dir, 0700);
+			*p = '/';
+			if (rc != 0 && errno != EEXIST) {
+				return -1;
+			}
+		}
+	}
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+		return -1;
+	}
+	return 0;
+}
+
+// mg_sip_write_all writes size bytes from data to fd, retrying short writes and
+// EINTR. Returns 0 on success, -1 on error.
+static int mg_sip_write_all(int fd, const uint8_t *data, size_t size) {
+	size_t off = 0;
+	while (off < size) {
+		ssize_t n = write(fd, data + off, size - off);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		if (n == 0) {
+			return -1;
+		}
+		off += (size_t)n;
+	}
+	return 0;
+}
+
+// mg_sip_run_codesign spawns /usr/bin/codesign with argv via the real
+// posix_spawn (D1 adds the exec hooks and D2 the reentrancy guard; C2 predates
+// both, so this is a plain unhooked spawn) and waits for it. It returns 0 with
+// the child's exit status in *out_exit, or -1 if the spawn, the wait, or the
+// child (killed by a signal) failed.
+static int mg_sip_run_codesign(char *const argv[], int *out_exit) {
+	pid_t pid = 0;
+	char **envp = *_NSGetEnviron();
+	int rc = posix_spawn(&pid, "/usr/bin/codesign", NULL, NULL, argv, envp);
+	if (rc != 0) {
+		errno = rc;
+		return -1;
+	}
+	int status = 0;
+	for (;;) {
+		if (waitpid(pid, &status, 0) >= 0) {
+			break;
+		}
+		if (errno == EINTR) {
+			continue;
+		}
+		return -1;
+	}
+	if (!WIFEXITED(status)) {
+		return -1;
+	}
+	*out_exit = WEXITSTATUS(status);
+	return 0;
+}
+
+// mg_sip_adhoc_resign strips path's signature and replaces it with an ad-hoc
+// one, so dyld stops enforcing the restrictions (library validation, hardened
+// runtime) that would otherwise make it ignore DYLD_INSERT_LIBRARIES for this
+// copy. Mirrors adhocResign: --remove-signature may exit non-zero on an already
+// unsigned slice ("object is not signed at all"), a harmless no-op whose result
+// is deliberately ignored; only the "-s - -f" ad-hoc sign must succeed. Returns 0
+// on success, -1 on a spawn/wait failure or a non-zero codesign exit.
+static int mg_sip_adhoc_resign(const char *path) {
+	int exit_code = 0;
+	char *remove_argv[] = {
+		(char *)"/usr/bin/codesign", (char *)"--remove-signature",
+		(char *)path, NULL,
+	};
+	(void)mg_sip_run_codesign(remove_argv, &exit_code);
+
+	char *sign_argv[] = {
+		(char *)"/usr/bin/codesign", (char *)"-s", (char *)"-",
+		(char *)"-f", (char *)path, NULL,
+	};
+	exit_code = 0;
+	if (mg_sip_run_codesign(sign_argv, &exit_code) != 0) {
+		return -1;
+	}
+	if (exit_code != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+// mg_sip_patch makes path loadable with DYLD_INSERT_LIBRARIES honored and returns
+// a newly malloc'd path to the executable to run (the caller frees), or NULL. The
+// NULL return is overloaded and disambiguated by mg_sip_last_error, which
+// mg_sip_patch clears on entry: NULL with an empty last-error means "no patch
+// needed" (run path unchanged); NULL with a non-empty last-error is a hard
+// failure the D1 exec detour turns into a failed exec. Mirrors patchIfRestricted:
+//   1. A "#!" script patches its interpreter recursively (an interpreter can
+//      itself be restricted, e.g. /bin/bash) and returns that result; the D1
+//      detour re-derives argv from the shebang.
+//   2. An unrestricted binary needs no patch -> NULL, empty error.
+//   3. A restricted binary already in the cache is reused.
+//   4. Otherwise it is thinned to an injectable slice, written to a temp file in
+//      the cache dir, ad-hoc re-signed, and atomically renamed into place. The
+//      original binary is never modified.
+static char *mg_sip_patch(const char *path) {
+	mg_sip_error[0] = 0;
+	if (!path) {
+		mg_sip_set_error("sip: null path");
+		return NULL;
+	}
+
+	char interp[PATH_MAX];
+	int shebang = mg_sip_read_shebang(path, interp, sizeof(interp));
+	if (shebang < 0) {
+		mg_sip_set_error("sip: read shebang");
+		return NULL;
+	}
+	if (shebang == 1) {
+		return mg_sip_patch(interp); // single-level recursion, like the Go port
+	}
+
+	int need = mg_sip_needs_patch(path);
+	if (need < 0) {
+		mg_sip_set_error("sip: needs-patch check");
+		return NULL;
+	}
+	if (need == 0) {
+		return NULL; // no patch needed; last-error stays empty
+	}
+
+	char *cache = mg_sip_cache_path(path);
+	if (!cache) {
+		mg_sip_set_error("sip: cache path");
+		return NULL;
+	}
+	if (access(cache, F_OK) == 0) {
+		return cache; // reuse a prior patch
+	}
+
+	char *dir = NULL;
+	char *tmpl = NULL;
+	uint8_t *data = NULL;
+	int tfd = -1;
+	int tmp_created = 0;
+
+	size_t len = 0;
+	data = mg_sip_read_file(path, &len);
+	if (!data) {
+		mg_sip_set_error("sip: read file");
+		goto fail;
+	}
+
+	size_t off = 0;
+	size_t size = 0;
+	int rosetta = 0;
+	char *slice = mg_sip_choose_slice(data, len, &off, &size, &rosetta);
+	if (!slice) {
+		mg_sip_set_error("sip: no injectable slice");
+		goto fail;
+	}
+
+	const char *last = strrchr(cache, '/');
+	if (!last) {
+		mg_sip_set_error("sip: bad cache path");
+		goto fail;
+	}
+	size_t dir_len = (size_t)(last - cache);
+	dir = (char *)malloc(dir_len + 1);
+	if (!dir) {
+		mg_sip_set_error("sip: out of memory");
+		goto fail;
+	}
+	memcpy(dir, cache, dir_len);
+	dir[dir_len] = 0;
+	if (mg_sip_mkdir_parents(dir) != 0) {
+		mg_sip_set_error("sip: mkdir cache dir");
+		goto fail;
+	}
+
+	static const char suffix[] = "/.sip-XXXXXX";
+	size_t tmpl_len = dir_len + sizeof(suffix); // sizeof includes the NUL
+	tmpl = (char *)malloc(tmpl_len);
+	if (!tmpl) {
+		mg_sip_set_error("sip: out of memory");
+		goto fail;
+	}
+	snprintf(tmpl, tmpl_len, "%s%s", dir, suffix);
+	tfd = mkstemp(tmpl);
+	if (tfd < 0) {
+		mg_sip_set_error("sip: create temp file");
+		goto fail;
+	}
+	tmp_created = 1;
+
+	if (mg_sip_write_all(tfd, (const uint8_t *)slice, size) != 0) {
+		mg_sip_set_error("sip: write slice");
+		goto fail;
+	}
+	if (fchmod(tfd, 0700) != 0) {
+		mg_sip_set_error("sip: chmod temp file");
+		goto fail;
+	}
+	if (close(tfd) != 0) {
+		tfd = -1;
+		mg_sip_set_error("sip: close temp file");
+		goto fail;
+	}
+	tfd = -1;
+
+	if (mg_sip_adhoc_resign(tmpl) != 0) {
+		mg_sip_set_error("sip: ad-hoc re-sign");
+		goto fail;
+	}
+	if (rename(tmpl, cache) != 0) {
+		mg_sip_set_error("sip: rename into cache");
+		goto fail;
+	}
+	tmp_created = 0;
+
+	free(tmpl);
+	free(dir);
+	free(data);
+	return cache; // caller frees
+
+fail:
+	if (tfd >= 0) {
+		close(tfd);
+	}
+	if (tmp_created) {
+		unlink(tmpl);
+	}
+	free(tmpl);
+	free(dir);
+	free(data);
+	free(cache);
+	return NULL;
 }
 
 #endif // __APPLE__

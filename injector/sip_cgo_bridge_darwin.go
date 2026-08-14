@@ -53,3 +53,29 @@ func sipNeedsPatch(path string) int {
 	defer C.free(unsafe.Pointer(cpath))
 	return int(C.mg_sip_needs_patch(cpath))
 }
+
+// sipPatchResult mirrors the outcome of the C mg_sip_patch: the returned path
+// (empty when the C returned NULL), whether the C returned non-NULL, and the
+// thread-local last-error string read after the call. On a NULL return, an empty
+// err means "no patch needed" and a non-empty err means a hard failure.
+type sipPatchResult struct {
+	path string
+	ok   bool
+	err  string
+}
+
+// sipPatch calls the C mg_sip_patch, copying then freeing the malloc'd result,
+// and reads mg_sip_last_error after the call so the test can distinguish the
+// no-patch and failure cases that both return NULL.
+func sipPatch(path string) sipPatchResult {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	r := C.mg_sip_patch(cpath)
+	res := sipPatchResult{err: C.GoString(C.mg_sip_last_error())}
+	if r != nil {
+		res.path = C.GoString(r)
+		res.ok = true
+		C.free(unsafe.Pointer(r))
+	}
+	return res
+}
