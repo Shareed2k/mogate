@@ -25,7 +25,29 @@ This repository is an engineering foundation, not a feature-complete interceptio
 | Remote `lseek`/`fstat` | Implemented | Implemented |
 | Root-confined file access | Implemented with `os.Root` | Implemented with `os.Root` |
 
-The macOS build was exercised end to end with a custom native process. Apple platform binaries such as `/bin/cat` may ignore `DYLD_INSERT_LIBRARIES` because of SIP or hardened-runtime policy.
+The macOS build was exercised end to end with a custom native process, including SIP-restricted system binaries (see below).
+
+### macOS SIP-restricted binaries
+
+macOS System Integrity Protection and the hardened runtime make protected
+system binaries such as `/usr/bin/curl` and `/bin/bash` ignore
+`DYLD_INSERT_LIBRARIES`, so the injector cannot load into them directly. `mogate`
+works around this by running an ad-hoc-re-signed **copy** of the target instead
+of the original:
+
+- The restricted binary is copied, thinned to its `x86_64` slice, and ad-hoc
+  re-signed. Re-signing strips the entitlements that enforce library
+  validation, so the copy honors `DYLD_INSERT_LIBRARIES` and the injector loads.
+- Originals are never modified; only the copy is patched.
+- The `x86_64` copy runs under Rosetta 2. Restricted children reached through
+  `execve`/`execvp`/`posix_spawn(p)` and `#!` scripts are patched the same way,
+  so an injected `bash` keeps interception across the processes it launches.
+
+Requirements: Rosetta 2 must be installed for the `x86_64` path, and an
+`x86_64` build of the injector library must be present. Limitation:
+`arm64e`-only binaries with no `x86_64` slice cannot be re-signed without
+library validation and are unsupported — such targets fail loudly rather than
+running uninjected.
 
 ## Deliberate current limits
 
