@@ -90,3 +90,91 @@ func TestSIPExecNoRecursion(t *testing.T) {
 		t.Fatalf("expected curl --version output, got:\n%s", out.String())
 	}
 }
+
+// buildInjectorArch builds the injector dylib for one arch (x86_64|arm64) from
+// main.go's cgo block, the same way the Makefile does, and returns its path.
+func buildInjectorArch(t *testing.T, arch string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "injector-"+arch+".dylib")
+	cmd := exec.Command("/bin/bash", "-c",
+		`sed -n '/^\/\*$/,/^\*\/$/p' main.go | sed '1d;$d;/^#cgo /d' | `+
+			`/usr/bin/clang -x c -Iinjector -I. -O2 -fPIC -arch `+arch+` -dynamiclib `+
+			`-Wno-deprecated-declarations -ldl -pthread -o `+out+` -`)
+	if o, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build %s injector: %v\n%s", arch, err, o)
+	}
+	return out
+}
+
+// TestSIPExecArm64ChildGetsArm64Injector proves the exec detour loads the
+// arm64 injector (not the parent's x86_64 one) into a NON-restricted arm64
+// child. A restricted top-level (here a thinned x86_64 bash) runs under Rosetta
+// with the x86_64 injector; when it spawns an arm64 child, inheriting the x86_64
+// injector would make dyld abort the child with an arch mismatch. The detour
+// must pick MOGATE_INJECTOR_ARM64 for the arm64 child instead.
+func TestSIPExecArm64ChildGetsArm64Injector(t *testing.T) {
+	for _, tool := range []string{"/usr/bin/clang", "/usr/bin/lipo", "/usr/bin/codesign", "/bin/bash"} {
+		if _, err := os.Stat(tool); err != nil {
+			t.Skipf("missing %s: %v", tool, err)
+		}
+	}
+	if _, err := os.Stat("protocol_generated.h"); err != nil {
+		t.Skip("protocol_generated.h missing; run: go generate ./internal/protocol")
+	}
+	if err := exec.Command("/usr/bin/arch", "-x86_64", "/usr/bin/true").Run(); err != nil {
+		t.Skipf("Rosetta 2 not available: %v", err)
+	}
+
+	tmp := t.TempDir()
+	x64 := buildInjectorArch(t, "x86_64")
+	arm := buildInjectorArch(t, "arm64")
+
+	// A tiny NON-restricted arm64 child that prints a marker. Because it has an
+	// arm64 slice and no SF_RESTRICTED flag, dyld runs it as arm64 and honors
+	// DYLD_INSERT_LIBRARIES — so it needs the arm64 injector.
+	csrc := filepath.Join(tmp, "child.c")
+	if err := os.WriteFile(csrc, []byte("#include <stdio.h>\nint main(void){puts(\"child-arm64-ok\");return 0;}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(tmp, "child")
+	if o, err := exec.Command("/usr/bin/clang", "-arch", "arm64", csrc, "-o", child).CombinedOutput(); err != nil {
+		t.Fatalf("build arm64 child: %v\n%s", err, o)
+	}
+
+	// Restricted top-level: a thinned x86_64 bash that runs under Rosetta.
+	bashx := filepath.Join(tmp, "bashx")
+	if o, err := exec.Command("/usr/bin/lipo", "/bin/bash", "-thin", "x86_64", "-output", bashx).CombinedOutput(); err != nil {
+		t.Fatalf("lipo thin bash: %v\n%s", err, o)
+	}
+	_ = exec.Command("/usr/bin/codesign", "--remove-signature", bashx).Run()
+	if o, err := exec.Command("/usr/bin/codesign", "-s", "-", "-f", bashx).CombinedOutput(); err != nil {
+		t.Fatalf("codesign bashx: %v\n%s", err, o)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bashx, "-c", child)
+	cmd.Env = append(os.Environ(),
+		"DYLD_INSERT_LIBRARIES="+x64, // parent (bash) runs x86_64
+		"MOGATE_INJECTOR_X86_64="+x64,
+		"MOGATE_INJECTOR_ARM64="+arm,
+		"MOGATE_SOCKET="+filepath.Join(tmp, "relay.sock"),
+	)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("arm64 child hung:\n%s", out.String())
+	}
+	if bytes.Contains(out.Bytes(), []byte("incompatible architecture")) {
+		t.Fatalf("arm64 child got the wrong-arch injector (dyld abort):\n%s", out.String())
+	}
+	if err != nil {
+		t.Fatalf("arm64 child failed: %v\n%s", err, out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("child-arm64-ok")) {
+		t.Fatalf("expected the arm64 child to run, got:\n%s", out.String())
+	}
+}

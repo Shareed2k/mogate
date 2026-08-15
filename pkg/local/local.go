@@ -311,7 +311,24 @@ func injectedEnvironment(base []string, options injectionOptions, library string
 	if existing != "" {
 		library += string(os.PathListSeparator) + existing
 	}
-	return setEnv(env, loaderVariable, library)
+	env = setEnv(env, loaderVariable, library)
+	if runtime.GOOS == "darwin" {
+		// Export both injector builds so the C child-exec interposer can load the
+		// one matching each child's architecture. A restricted child is thinned to
+		// x86_64 and runs under Rosetta (x86_64 injector); a non-restricted arm64
+		// child (e.g. a Homebrew tool) runs arm64 natively even from this x86_64
+		// parent and needs the arm64 injector — inheriting this process's x86_64
+		// injector would make dyld reject the insert and abort the child.
+		if abs, err := filepath.Abs(options.library); err == nil {
+			env = setEnv(env, "MOGATE_INJECTOR_ARM64", abs)
+		}
+		if options.libraryRosetta != "" {
+			if abs, err := filepath.Abs(options.libraryRosetta); err == nil {
+				env = setEnv(env, "MOGATE_INJECTOR_X86_64", abs)
+			}
+		}
+	}
+	return env
 }
 
 // setEnv sets key to value in env, replacing any existing entry.

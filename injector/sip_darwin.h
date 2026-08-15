@@ -1273,7 +1273,12 @@ static char **mg_sip_fix_env(char *const envp[], const char *self, const char *s
 		const char *e = envp[i];
 		char *repl;
 		if (self && strncmp(e, dyld_pfx, sizeof(dyld_pfx) - 1) == 0) {
-			repl = mg_sip_dyld_entry(e + sizeof(dyld_pfx) - 1, self);
+			// Replace, do not merge: the inherited DYLD_INSERT_LIBRARIES is the
+			// PARENT's injector, whose arch may not match this child (an x86_64
+			// parent spawning an arm64 child). Keeping it would make dyld try to
+			// load a wrong-arch dylib and abort the child. self is already the
+			// arch-matched injector chosen by mg_sip_pick_injector.
+			repl = mg_sip_dyld_entry(NULL, self);
 			dyld_done = 1;
 		} else if (socket && strncmp(e, sock_pfx, sizeof(sock_pfx) - 1) == 0) {
 			repl = mg_sip_join2(sock_pfx, socket);
@@ -1508,6 +1513,73 @@ typedef int (*mg_sip_spawn_fn)(pid_t *, const char *,
 	const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
 	char *const[], char *const[]);
 
+// mg_sip_run_arch_arm64 reports whether dyld will run `path` as arm64/arm64e
+// (it has an arm64 slice, or is not a Mach-O so the native host arch applies),
+// as opposed to an x86_64-only Mach-O that runs under Rosetta. It underpins
+// per-child injector selection: a restricted child is thinned to an x86_64 copy
+// (runs under Rosetta), but a NON-restricted arm64 child (e.g. a Homebrew tool)
+// runs arm64 natively even when its parent is an x86_64/Rosetta process — so it
+// must get the arm64 injector, not the x86_64 one the parent carries. Unreadable
+// paths and scripts default to arm64 (the host arch).
+static int mg_sip_run_arch_arm64(const char *path) {
+	size_t len = 0;
+	uint8_t *data = mg_sip_read_file(path, &len);
+	if (!data || len < 4) {
+		free(data);
+		return 1;
+	}
+	int result = 1; // non-Mach-O (script/other) -> host arm64
+	uint32_t be = mg_sip_be32(data);
+	if (be == MG_SIP_FAT_MAGIC) {
+		result = 0; // fat: arm64 only if a slice declares CPU_TYPE_ARM64
+		if (len >= 8) {
+			uint32_t nfat = mg_sip_be32(data + 4);
+			for (uint32_t i = 0; i < nfat; i++) {
+				size_t entry = 8 + (size_t)i * 20u;
+				if (entry + 20u > len) {
+					break;
+				}
+				if (mg_sip_be32(data + entry) == MG_SIP_CPU_TYPE_ARM64) {
+					result = 1;
+					break;
+				}
+			}
+		}
+	} else {
+		int big_endian = 0;
+		int is64 = 0;
+		if (mg_sip_thin_header(data, len, &big_endian, &is64) && len >= 8) {
+			uint32_t cputype = mg_sip_rd32(data + 4, big_endian);
+			if (cputype == MG_SIP_CPU_TYPE_ARM64) {
+				result = 1;
+			} else if (cputype == MG_SIP_CPU_TYPE_X86_64) {
+				result = 0;
+			}
+		}
+	}
+	free(data);
+	return result;
+}
+
+// mg_sip_pick_injector returns the injector library path matching the arch dyld
+// will run `path` as. honey exports both builds into the injected environment
+// (MOGATE_INJECTOR_ARM64 / MOGATE_INJECTOR_X86_64); choosing per child keeps an
+// arm64 child paired with the arm64 injector and an x86_64/Rosetta child with the
+// x86_64 one, so dyld never rejects a wrong-arch insert. Falls back to `self`
+// (the current process's own injector) when honey did not export the pair.
+static const char *mg_sip_pick_injector(const char *path, const char *self) {
+	const char *arm = getenv("MOGATE_INJECTOR_ARM64");
+	const char *x64 = getenv("MOGATE_INJECTOR_X86_64");
+	if (mg_sip_run_arch_arm64(path)) {
+		if (arm && arm[0]) {
+			return arm;
+		}
+	} else if (x64 && x64[0]) {
+		return x64;
+	}
+	return self;
+}
+
 // mg_sip_execve_detour is the core execve/execvp path: resolve the exec plan for
 // path, build a DYLD/MOGATE_SOCKET-preserving envp, rebuild argv for a script,
 // and call real. On a hard patch failure it sets errno=ENOEXEC and returns -1
@@ -1529,7 +1601,7 @@ static int mg_sip_execve_detour(const char *path, char *const argv[], char *cons
 		errno = ENOEXEC;
 		return -1;
 	}
-	char **new_env = mg_sip_fix_env(envp, self, socket);
+	char **new_env = mg_sip_fix_env(envp, mg_sip_pick_injector(target.path, self), socket);
 	if (!new_env) {
 		mg_sip_exec_target_free(&target);
 		errno = ENOMEM;
@@ -1581,7 +1653,7 @@ static int mg_sip_posix_spawn_detour(pid_t *pid, const char *path,
 		return ENOEXEC;
 	}
 	char *const *base = envp ? envp : (char *const *)*_NSGetEnviron();
-	char **new_env = mg_sip_fix_env(base, self, socket);
+	char **new_env = mg_sip_fix_env(base, mg_sip_pick_injector(target.path, self), socket);
 	if (!new_env) {
 		mg_sip_exec_target_free(&target);
 		return ENOMEM;

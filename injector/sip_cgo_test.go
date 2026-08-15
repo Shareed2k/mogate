@@ -261,14 +261,21 @@ func TestCSipExecDetour_NonRestrictedOriginal(t *testing.T) {
 	assertInjectedEnv(t, rec.env)
 }
 
-// TestCSipExecDetour_PreservesExistingDyld proves that when the child env already
-// lists the injector in DYLD_INSERT_LIBRARIES, the detour does not duplicate it
-// and preserves any other entries the caller set.
-func TestCSipExecDetour_PreservesExistingDyld(t *testing.T) {
+// TestCSipExecDetour_ReplacesInheritedDyld proves the detour SETS
+// DYLD_INSERT_LIBRARIES to exactly the arch-matched injector, replacing (not
+// merging) the value the child inherited from its parent — so a parent's
+// wrong-arch injector can never reach the child and abort it in dyld.
+func TestCSipExecDetour_ReplacesInheritedDyld(t *testing.T) {
 	plain := filepath.Join(t.TempDir(), "plain")
 	if err := os.WriteFile(plain, []byte("not a mach-o\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A child inherits the PARENT's DYLD_INSERT_LIBRARIES, which points at the
+	// parent's injector — whose architecture may not match this child (an x86_64
+	// parent spawning an arm64 child). The detour must SET DYLD to exactly the
+	// arch-matched injector, never merge the inherited value: a merged wrong-arch
+	// injector would make dyld abort the child. With no MOGATE_INJECTOR_* env set,
+	// the arch-matched injector falls back to self.
 	existing := testSelf + ":/some/other.dylib"
 	rec := sipExecveDetour(plain,
 		[]string{plain},
@@ -279,11 +286,8 @@ func TestCSipExecDetour_PreservesExistingDyld(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing DYLD_INSERT_LIBRARIES: %v", rec.env)
 	}
-	if dyld != existing {
-		t.Errorf("DYLD_INSERT_LIBRARIES = %q, want it left as %q (self already present)", dyld, existing)
-	}
-	if strings.Count(dyld, testSelf) != 1 {
-		t.Errorf("self %q duplicated in %q", testSelf, dyld)
+	if dyld != testSelf {
+		t.Errorf("DYLD_INSERT_LIBRARIES = %q, want %q (replaced with the arch-matched injector; inherited value dropped)", dyld, testSelf)
 	}
 }
 
