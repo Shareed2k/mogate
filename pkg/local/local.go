@@ -211,11 +211,21 @@ func resolveExecutable(name string) (string, error) {
 
 // execute runs command with the injector loaded through the platform loader
 // variable. On macOS it first PATH-resolves a bare command[0] to the real
-// binary, then patches it when it is a restricted system binary, rewriting argv
-// to run the patched copy (or the patched interpreter, for a "#!" script) so
-// DYLD_INSERT_LIBRARIES is honored. It returns a descriptive error for a
-// non-zero command exit.
+// binary, then patches it when it is a restricted system binary, running the
+// patched copy (or the patched interpreter, for a "#!" script) so
+// DYLD_INSERT_LIBRARIES is honored. For the non-script case it preserves the
+// caller's original argv[0], matching the C child detour. It returns a
+// descriptive error for a non-zero command exit.
 func execute(ctx context.Context, options injectionOptions, command []string) error {
+	// Preserve the name the user passed as argv[0]. The C child detour execs the
+	// patched path but passes the caller's argv through unchanged
+	// (injector/sip_darwin.h), so a program that inspects argv[0] -- a
+	// login/multi-call shell, os.Args[0] self-location -- must see the same value
+	// whether it is spawned here at the Go top level or re-exec'd by a child.
+	// Capture it before the darwin resolve and res.path replacement below rewrite
+	// command[0].
+	origArg0 := command[0]
+
 	// On darwin the SIP-patch step below opens command[0] directly, so a bare
 	// name must first be resolved to the binary PATH would run. Off darwin
 	// exec.Command still resolves at spawn, so this is darwin-only and the
@@ -231,16 +241,7 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 	if err != nil {
 		return err
 	}
-	if res.scriptInterp != "" {
-		rebuilt := make([]string, 0, 1+len(res.scriptArgs)+len(command))
-		rebuilt = append(rebuilt, res.scriptInterp)
-		rebuilt = append(rebuilt, res.scriptArgs...)
-		rebuilt = append(rebuilt, command[0])
-		rebuilt = append(rebuilt, command[1:]...)
-		command = rebuilt
-	} else {
-		command[0] = res.path
-	}
+	execPath, argv := assembleExec(origArg0, command, res)
 
 	lib, err := selectInjector(options, res)
 	if err != nil {
@@ -253,7 +254,8 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 	if _, err := os.Stat(library); err != nil {
 		return fmt.Errorf("injector library: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd := exec.CommandContext(ctx, execPath)
+	cmd.Args = argv
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -266,6 +268,29 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 		return fmt.Errorf("run command: %w", err)
 	}
 	return nil
+}
+
+// assembleExec builds the (execPath, argv) pair execute runs. For the non-script
+// case it runs the PATCHED binary (res.path) while keeping the caller's original
+// argv[0] (origArg0), matching the C child detour, which execs the patched path
+// but passes the caller's argv through unchanged (injector/sip_darwin.h). For a
+// "#!" script the (possibly patched) interpreter is both the program and argv[0],
+// followed by the shebang args, the script path, and the original args -- how a
+// shebang exec works; command[0] here is the resolved script path. The returned
+// argv never aliases command.
+func assembleExec(origArg0 string, command []string, res sipResult) (execPath string, argv []string) {
+	if res.scriptInterp != "" {
+		argv = make([]string, 0, 1+len(res.scriptArgs)+len(command))
+		argv = append(argv, res.scriptInterp)
+		argv = append(argv, res.scriptArgs...)
+		argv = append(argv, command[0])
+		argv = append(argv, command[1:]...)
+		return res.scriptInterp, argv
+	}
+	argv = make([]string, len(command))
+	copy(argv, command)
+	argv[0] = origArg0
+	return res.path, argv
 }
 
 // injectedEnvironment returns base extended with the relay socket, file mode,

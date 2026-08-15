@@ -192,10 +192,10 @@ func codeSignatureFlags(data []byte) (flags uint32, hasDyldEnt bool, err error) 
 	if err != nil || !ok {
 		return 0, false, err
 	}
-	if int(sigOff)+int(sigSize) > len(data) {
+	if sigOff+uint64(sigSize) > uint64(len(data)) {
 		return 0, false, errors.New("sip: code signature out of bounds")
 	}
-	blob := data[sigOff : sigOff+sigSize]
+	blob := data[sigOff : sigOff+uint64(sigSize)]
 	return parseCSSuperBlob(blob)
 }
 
@@ -208,8 +208,11 @@ const lcCodeSignature = 0x1d
 // blob (LC_CODE_SIGNATURE) of the first Mach-O slice that carries one. For a
 // fat binary the offset is absolute within data: the arch's fat-header
 // offset plus that slice's own dataoff, since dataoff is relative to the
-// start of the slice, not the start of the fat file.
-func firstCodeSignature(data []byte) (offset, size uint32, ok bool, err error) {
+// start of the slice, not the start of the fat file. The offset is returned as
+// a uint64 and the fat sum is computed in 64-bit and bounds-checked against
+// len(data), so a crafted fat header cannot wrap two uint32s past the buffer
+// (mirroring the C side at injector/sip_darwin.h:321-324).
+func firstCodeSignature(data []byte) (offset uint64, size uint32, ok bool, err error) {
 	reader := bytes.NewReader(data)
 	if fat, ferr := macho.NewFatFile(reader); ferr == nil {
 		defer fat.Close()
@@ -219,7 +222,11 @@ func firstCodeSignature(data []byte) (offset, size uint32, ok bool, err error) {
 				return 0, 0, false, findErr
 			}
 			if found {
-				return arch.Offset + off, sz, true, nil
+				absolute := uint64(arch.Offset) + uint64(off)
+				if absolute > uint64(len(data)) {
+					return 0, 0, false, errors.New("sip: code signature offset out of bounds")
+				}
+				return absolute, sz, true, nil
 			}
 		}
 		return 0, 0, false, nil
@@ -236,7 +243,7 @@ func firstCodeSignature(data []byte) (offset, size uint32, ok bool, err error) {
 	if err != nil {
 		return 0, 0, false, err
 	}
-	return off, sz, found, nil
+	return uint64(off), sz, found, nil
 }
 
 // codeSignatureLoad scans f.Loads for LC_CODE_SIGNATURE and returns its

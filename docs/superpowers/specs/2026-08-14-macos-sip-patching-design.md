@@ -71,6 +71,12 @@ For a binary `B` at path `P`:
    the binary is **not** entitled `com.apple.security.cs.allow-dyld-environment-variables`
    (that entitlement means dyld already honors insertion — no patch needed).
    A non-Mach-O, non-`#!` file, or an unrestricted binary → no patch (run as-is).
+   Detection intentionally covers `SF_RESTRICTED` + CS `RESTRICT|RUNTIME` (minus
+   the dyld-env entitlement) and does **not** special-case setuid/setgid or the
+   platform-binary cdhash: Apple system binaries always carry `SF_RESTRICTED` so
+   are covered, whereas a non-Apple setuid binary lacking those flags would run
+   un-patched (and its ad-hoc copy would lose setuid anyway) — an accepted
+   out-of-scope limitation matching the reference implementation.
 
 2. **Thin** — choose a loadable slice from the (possibly fat) Mach-O:
    - prefer a **plain-arm64** slice (`CPU_TYPE_ARM64` and **not** `CPU_SUBTYPE_ARM64E`) — runs natively, native `arm64` injector;

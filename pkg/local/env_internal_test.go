@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -148,4 +149,77 @@ func TestSelectInjector(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAssembleExec(t *testing.T) {
+	t.Run("non-script runs the patched path but keeps the original argv[0]", func(t *testing.T) {
+		// execute() captures origArg0 as the name the user passed, then (on
+		// darwin) rewrites command[0] to the resolved binary before patching.
+		// assembleExec must run the PATCHED path (res.path) while argv[0] stays
+		// the original name -- matching the C child detour, which execs the
+		// patched path with the caller's argv unchanged.
+		origArg0 := "curl"
+		command := []string{"/usr/bin/curl", "http://svc"}
+		res := sipResult{path: "/cache/mogate/sip/v1/usr/bin/curl", arch: sipArchRosetta, patched: true}
+
+		execPath, argv := assembleExec(origArg0, command, res)
+
+		if execPath != res.path {
+			t.Fatalf("execPath = %q, want the patched path %q", execPath, res.path)
+		}
+		want := []string{"curl", "http://svc"}
+		if !slices.Equal(argv, want) {
+			t.Fatalf("argv = %v, want %v", argv, want)
+		}
+		if argv[0] != origArg0 {
+			t.Fatalf("argv[0] = %q, want the original name %q", argv[0], origArg0)
+		}
+		// The returned argv must not alias command: rewriting argv[0] must not
+		// mutate the caller's slice.
+		if command[0] != "/usr/bin/curl" {
+			t.Fatalf("command[0] mutated to %q; assembleExec must not alias command", command[0])
+		}
+	})
+
+	t.Run("unpatched non-script still restores the original argv[0]", func(t *testing.T) {
+		// With no patch (the off-darwin no-op result) res.path == command[0] and
+		// argv[0] is still the original name -- byte-identical to a plain
+		// exec.Command(name), which sets Args[0] to the name it was given.
+		origArg0 := "mytool"
+		command := []string{"/abs/mytool", "-v"}
+		res := sipResult{path: "/abs/mytool", arch: sipArchNative, patched: false}
+
+		execPath, argv := assembleExec(origArg0, command, res)
+
+		if execPath != "/abs/mytool" {
+			t.Fatalf("execPath = %q, want %q", execPath, "/abs/mytool")
+		}
+		if !slices.Equal(argv, []string{"mytool", "-v"}) {
+			t.Fatalf("argv = %v, want [mytool -v]", argv)
+		}
+	})
+
+	t.Run("script runs the interpreter as program and argv[0], then shebang args, script, and original args", func(t *testing.T) {
+		// For a "#!" script the (possibly patched) interpreter is both the
+		// program and argv[0]; command[0] here is the resolved script path.
+		origArg0 := "./deploy.sh"
+		command := []string{"/work/deploy.sh", "prod"}
+		res := sipResult{
+			path:         "/cache/bin/bash",
+			arch:         sipArchRosetta,
+			patched:      true,
+			scriptInterp: "/cache/bin/bash",
+			scriptArgs:   []string{"-x"},
+		}
+
+		execPath, argv := assembleExec(origArg0, command, res)
+
+		if execPath != res.scriptInterp {
+			t.Fatalf("execPath = %q, want the interpreter %q", execPath, res.scriptInterp)
+		}
+		want := []string{"/cache/bin/bash", "-x", "/work/deploy.sh", "prod"}
+		if !slices.Equal(argv, want) {
+			t.Fatalf("argv = %v, want %v", argv, want)
+		}
+	})
 }

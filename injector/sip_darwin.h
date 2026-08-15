@@ -889,11 +889,17 @@ static int mg_sip_write_all(int fd, const uint8_t *data, size_t size) {
 	return 0;
 }
 
-// mg_sip_run_codesign spawns /usr/bin/codesign with argv via the real
-// posix_spawn (D1 adds the exec hooks and D2 the reentrancy guard; C2 predates
-// both, so this is a plain unhooked spawn) and waits for it. It returns 0 with
-// the child's exit status in *out_exit, or -1 if the spawn, the wait, or the
-// child (killed by a signal) failed.
+// mg_sip_run_codesign spawns /usr/bin/codesign with argv via posix_spawn and
+// waits for it. In the shipped dylib this posix_spawn is itself interposed
+// (MG_INTERPOSE posix_spawn -> mg_posix_spawn_hook) like every other in the
+// process -- it is not a special unhooked call. It stays safe because both
+// reentrancy guards are already set by the time it runs: mg_inside, raised by
+// the exec hook that drove this child patch and checked in that hook, and
+// mg_sip_in_patch, raised by mg_sip_patch around its whole body and checked in
+// the exec detour. Either one makes this re-entry pass straight through to the
+// real posix_spawn instead of trying to patch the very signing tool it spawns.
+// It returns 0 with the child's exit status in *out_exit, or -1 if the spawn,
+// the wait, or the child (killed by a signal) failed.
 static int mg_sip_run_codesign(char *const argv[], int *out_exit) {
 	pid_t pid = 0;
 	char **envp = *_NSGetEnviron();
