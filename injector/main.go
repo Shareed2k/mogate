@@ -30,6 +30,9 @@ package main
 #include <sys/uio.h>
 #include <unistd.h>
 #include "protocol_generated.h"
+#ifdef __APPLE__
+#include "sip_darwin.h"
+#endif
 
 #ifdef __APPLE__
 #include <sys/event.h>
@@ -187,6 +190,12 @@ static uint64_t mg_kqueue_token = 1;
 static struct addrinfo *mg_dns_heads[MG_MAX_DNS_RESULTS];
 static volatile int mg_ready;
 static __thread int mg_inside;
+#ifdef __APPLE__
+// mg_self_path caches this injector dylib's own filesystem path (via dladdr at
+// load), so the D1 exec detours can re-assert DYLD_INSERT_LIBRARIES=<self> in a
+// child's environment. Empty until mg_initialize runs, or if dladdr fails.
+static char mg_self_path[PATH_MAX];
+#endif
 
 #ifdef __APPLE__
 static int mg_raw_close(int fd) {
@@ -323,8 +332,22 @@ static int mg_symbols(void) {
 	return 0;
 }
 
+#ifdef __APPLE__
+static int mg_connect_hook(int sockfd, const struct sockaddr *address, socklen_t address_len);
+#endif
+
 __attribute__((constructor)) static void mg_initialize(void) {
 	if (mg_symbols() == 0) mg_ready = 1;
+#ifdef __APPLE__
+	Dl_info info;
+	if (dladdr((void *)&mg_connect_hook, &info) && info.dli_fname) {
+		size_t n = strlen(info.dli_fname);
+		if (n < sizeof(mg_self_path)) {
+			memcpy(mg_self_path, info.dli_fname, n);
+			mg_self_path[n] = 0;
+		}
+	}
+#endif
 }
 
 static void mg_put_u32(unsigned char *out, uint32_t value) {
@@ -2177,6 +2200,103 @@ static void mg_freeaddrinfo_hook(struct addrinfo *result) {
 	else mg_real_freeaddrinfo(result);
 }
 
+#ifdef __APPLE__
+// D1: exec-family interpose hooks (darwin only; exec is not SIP-hooked on linux).
+// Each is a thin wrapper that resolves the real libSystem exec symbol (past our
+// interposers) and hands the substantive work to the tested static detours in
+// sip_darwin.h. They no-op (pass straight through to the real call) when the
+// injector is inactive (MOGATE_SOCKET unset) or already inside an injector
+// operation (mg_inside).
+
+// mg_exec_symbol resolves a real exec-family symbol, preferring the libsystem
+// resolver and falling back to RTLD_NEXT so the lookup skips our interposer.
+static void *mg_exec_symbol(const char *name) {
+	void *symbol = mg_next_symbol(name);
+	if (!symbol) symbol = dlsym(RTLD_NEXT, name);
+	return symbol;
+}
+
+static const char *mg_self_or_null(void) {
+	return mg_self_path[0] ? mg_self_path : NULL;
+}
+
+static int mg_execve_hook(const char *path, char *const argv[], char *const envp[]) {
+	static mg_sip_execve_fn real;
+	if (!real) real = (mg_sip_execve_fn)mg_exec_symbol("execve");
+	if (!real) { errno = ENOSYS; return -1; }
+	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(path, argv, envp);
+	// Bracket the detour with mg_inside so the patch it performs (reading the
+	// binary, writing the cache, spawning codesign) re-enters our file/exec hooks
+	// as pass-throughs to the real calls, like every other hook in this file. The
+	// detour communicates failure via errno, so preserve it across the decrement.
+	mg_inside++;
+	int rc = mg_sip_execve_detour(path, argv, envp, mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	int saved = errno;
+	mg_inside--;
+	errno = saved;
+	return rc;
+}
+
+static int mg_execvp_hook(const char *file, char *const argv[]) {
+	static mg_sip_execvp_fn real_vp;
+	if (!real_vp) real_vp = (mg_sip_execvp_fn)mg_exec_symbol("execvp");
+	if (mg_inside || !getenv("MOGATE_SOCKET")) {
+		if (!real_vp) { errno = ENOSYS; return -1; }
+		return real_vp(file, argv);
+	}
+	static mg_sip_execve_fn real_ve;
+	if (!real_ve) real_ve = (mg_sip_execve_fn)mg_exec_symbol("execve");
+	if (!real_ve) {
+		if (!real_vp) { errno = ENOSYS; return -1; }
+		return real_vp(file, argv);
+	}
+	mg_inside++;
+	int rc = mg_sip_execvp_detour(file, argv, mg_self_or_null(), getenv("MOGATE_SOCKET"), real_ve);
+	int saved = errno;
+	mg_inside--;
+	errno = saved;
+	return rc;
+}
+
+static int mg_posix_spawn_hook(pid_t *pid, const char *path,
+	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+	char *const argv[], char *const envp[]) {
+	static mg_sip_spawn_fn real;
+	if (!real) real = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawn");
+	if (!real) return ENOSYS;
+	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(pid, path, fa, attr, argv, envp);
+	// See mg_execve_hook: mg_inside makes the patch's own file/exec re-entries
+	// pass through. posix_spawn reports errors via its return value, not errno.
+	mg_inside++;
+	int rc = mg_sip_posix_spawn_detour(pid, path, fa, attr, argv, envp,
+		mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	mg_inside--;
+	return rc;
+}
+
+static int mg_posix_spawnp_hook(pid_t *pid, const char *file,
+	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
+	char *const argv[], char *const envp[]) {
+	static mg_sip_spawn_fn real_p;
+	if (!real_p) real_p = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawnp");
+	if (mg_inside || !getenv("MOGATE_SOCKET")) {
+		if (!real_p) return ENOSYS;
+		return real_p(pid, file, fa, attr, argv, envp);
+	}
+	static mg_sip_spawn_fn real; // non-p: used after we PATH-resolve the target
+	if (!real) real = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawn");
+	if (!real) {
+		if (!real_p) return ENOSYS;
+		return real_p(pid, file, fa, attr, argv, envp);
+	}
+	mg_inside++;
+	int rc = mg_sip_posix_spawnp_detour(pid, file, fa, attr, argv, envp,
+		mg_self_or_null(), getenv("MOGATE_SOCKET"), real);
+	mg_inside--;
+	return rc;
+}
+#endif // __APPLE__
+
 #if defined(__APPLE__)
 #define MG_INTERPOSE(replacement, replacee) \
 	__attribute__((used)) static struct { const void *replacement; const void *replacee; } \
@@ -2184,6 +2304,10 @@ static void mg_freeaddrinfo_hook(struct addrinfo *result) {
 	{ (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee };
 
 MG_INTERPOSE(mg_connect_hook, connect)
+MG_INTERPOSE(mg_execve_hook, execve)
+MG_INTERPOSE(mg_execvp_hook, execvp)
+MG_INTERPOSE(mg_posix_spawn_hook, posix_spawn)
+MG_INTERPOSE(mg_posix_spawnp_hook, posix_spawnp)
 MG_INTERPOSE(mg_open_hook, open)
 MG_INTERPOSE(mg_openat_hook, openat)
 MG_INTERPOSE(mg_read_hook, read)

@@ -44,6 +44,11 @@ type Config struct {
 	// InjectorLib is the path to the injector .so/.dylib loaded through
 	// LD_PRELOAD (Linux) or DYLD_INSERT_LIBRARIES (macOS).
 	InjectorLib string
+	// InjectorLibRosetta is the path to the x86_64 build of the injector,
+	// loaded for a command thinned to its x86_64 slice that runs under Rosetta.
+	// It is required on Apple Silicon for restricted system binaries; on other
+	// platforms it is unused.
+	InjectorLibRosetta string
 	// Root is the filesystem root offered to remote file operations. An empty
 	// root disables file redirection.
 	Root string
@@ -139,9 +144,10 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 	}
 	tasks = append(tasks, session.Task{Name: "command", Run: func(taskCtx context.Context) error {
 		return execute(taskCtx, injectionOptions{
-			socket:  cfg.Socket,
-			library: cfg.InjectorLib,
-			files:   cfg.Modes.Files && cfg.Root != "",
+			socket:         cfg.Socket,
+			library:        cfg.InjectorLib,
+			libraryRosetta: cfg.InjectorLibRosetta,
+			files:          cfg.Modes.Files && cfg.Root != "",
 		}, command)
 	}})
 	return session.Run(runCtx, tasks...)
@@ -167,22 +173,89 @@ func readToken(path string) (string, error) {
 
 // injectionOptions configures how the injector is loaded into a command.
 type injectionOptions struct {
-	socket  string
-	library string
-	files   bool
+	socket         string
+	library        string
+	libraryRosetta string
+	files          bool
+}
+
+// selectInjector picks the injector matching the slice command[0] was thinned
+// to. A binary run natively (or any platform without SIP patching) takes the
+// primary library; one thinned to x86_64 under Rosetta takes the x86_64
+// library, and it is fail-loud when that path was not configured.
+func selectInjector(options injectionOptions, res sipResult) (string, error) {
+	if res.arch == sipArchRosetta {
+		if options.libraryRosetta == "" {
+			return "", fmt.Errorf("sip: %s needs the x86_64 injector but InjectorLibRosetta is unset", res.path)
+		}
+		return options.libraryRosetta, nil
+	}
+	return options.library, nil
+}
+
+// resolveExecutable resolves a bare command name to a concrete path via PATH,
+// mirroring what a shell (and exec.Command at spawn time) does. A name that
+// already contains a path separator is a path, not a PATH lookup, and is
+// returned unchanged. It exists so the darwin SIP-patch step opens the real
+// binary that would run, not a same-named file in the current directory.
+func resolveExecutable(name string) (string, error) {
+	if strings.ContainsRune(name, filepath.Separator) {
+		return name, nil
+	}
+	resolved, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve executable %q: %w", name, err)
+	}
+	return resolved, nil
 }
 
 // execute runs command with the injector loaded through the platform loader
-// variable. It returns a descriptive error for a non-zero command exit.
+// variable. On macOS it first PATH-resolves a bare command[0] to the real
+// binary, then patches it when it is a restricted system binary, running the
+// patched copy (or the patched interpreter, for a "#!" script) so
+// DYLD_INSERT_LIBRARIES is honored. For the non-script case it preserves the
+// caller's original argv[0], matching the C child detour. It returns a
+// descriptive error for a non-zero command exit.
 func execute(ctx context.Context, options injectionOptions, command []string) error {
-	library, err := filepath.Abs(options.library)
+	// Preserve the name the user passed as argv[0]. The C child detour execs the
+	// patched path but passes the caller's argv through unchanged
+	// (injector/sip_darwin.h), so a program that inspects argv[0] -- a
+	// login/multi-call shell, os.Args[0] self-location -- must see the same value
+	// whether it is spawned here at the Go top level or re-exec'd by a child.
+	// Capture it before the darwin resolve and res.path replacement below rewrite
+	// command[0].
+	origArg0 := command[0]
+
+	// On darwin the SIP-patch step below opens command[0] directly, so a bare
+	// name must first be resolved to the binary PATH would run. Off darwin
+	// exec.Command still resolves at spawn, so this is darwin-only and the
+	// non-darwin path stays byte-identical.
+	if runtime.GOOS == "darwin" {
+		resolved, err := resolveExecutable(command[0])
+		if err != nil {
+			return err
+		}
+		command[0] = resolved
+	}
+	res, err := patchIfRestricted(command[0])
+	if err != nil {
+		return err
+	}
+	execPath, argv := assembleExec(origArg0, command, res)
+
+	lib, err := selectInjector(options, res)
+	if err != nil {
+		return err
+	}
+	library, err := filepath.Abs(lib)
 	if err != nil {
 		return fmt.Errorf("resolve injector path: %w", err)
 	}
 	if _, err := os.Stat(library); err != nil {
 		return fmt.Errorf("injector library: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd := exec.CommandContext(ctx, execPath)
+	cmd.Args = argv
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -195,6 +268,29 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 		return fmt.Errorf("run command: %w", err)
 	}
 	return nil
+}
+
+// assembleExec builds the (execPath, argv) pair execute runs. For the non-script
+// case it runs the PATCHED binary (res.path) while keeping the caller's original
+// argv[0] (origArg0), matching the C child detour, which execs the patched path
+// but passes the caller's argv through unchanged (injector/sip_darwin.h). For a
+// "#!" script the (possibly patched) interpreter is both the program and argv[0],
+// followed by the shebang args, the script path, and the original args -- how a
+// shebang exec works; command[0] here is the resolved script path. The returned
+// argv never aliases command.
+func assembleExec(origArg0 string, command []string, res sipResult) (execPath string, argv []string) {
+	if res.scriptInterp != "" {
+		argv = make([]string, 0, 1+len(res.scriptArgs)+len(command))
+		argv = append(argv, res.scriptInterp)
+		argv = append(argv, res.scriptArgs...)
+		argv = append(argv, command[0])
+		argv = append(argv, command[1:]...)
+		return res.scriptInterp, argv
+	}
+	argv = make([]string, len(command))
+	copy(argv, command)
+	argv[0] = origArg0
+	return res.path, argv
 }
 
 // injectedEnvironment returns base extended with the relay socket, file mode,
