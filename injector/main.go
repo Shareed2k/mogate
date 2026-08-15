@@ -195,6 +195,17 @@ static __thread int mg_inside;
 // load), so the D1 exec detours can re-assert DYLD_INSERT_LIBRARIES=<self> in a
 // child's environment. Empty until mg_initialize runs, or if dladdr fails.
 static char mg_self_path[PATH_MAX];
+// Real exec-family entry points, resolved ONCE at load in mg_initialize (never
+// lazily). Under Rosetta the __DATA,__interpose table also rewrites dlsym
+// results, so resolving these on the first hook call — when the interpose is
+// fully live — returns our own hook and the detour's real() call recurses
+// forever. At constructor time the resolver still returns the real libSystem
+// symbol; this is the same reason the syscall reals (mg_real_connect etc.)
+// resolve in mg_initialize rather than on first use.
+static mg_sip_execve_fn mg_real_execve;
+static mg_sip_execvp_fn mg_real_execvp;
+static mg_sip_spawn_fn mg_real_posix_spawn;
+static mg_sip_spawn_fn mg_real_posix_spawnp;
 #endif
 
 #ifdef __APPLE__
@@ -347,6 +358,16 @@ __attribute__((constructor)) static void mg_initialize(void) {
 			mg_self_path[n] = 0;
 		}
 	}
+	// Resolve the real exec-family entry points by DIRECT symbol reference, not
+	// dlsym. A direct reference is bound by the static linker to libSystem's real
+	// implementation; dlsym (and dlsym(RTLD_NEXT)) instead return our own
+	// interposer under Rosetta, because the __DATA,__interpose table rewrites
+	// dlsym results there. Taking the address directly is the only resolution
+	// that reliably skips the interpose on both native arm64 and Rosetta x86_64.
+	mg_real_execve = (mg_sip_execve_fn)&execve;
+	mg_real_execvp = (mg_sip_execvp_fn)&execvp;
+	mg_real_posix_spawn = (mg_sip_spawn_fn)&posix_spawn;
+	mg_real_posix_spawnp = (mg_sip_spawn_fn)&posix_spawnp;
 #endif
 }
 
@@ -2208,21 +2229,12 @@ static void mg_freeaddrinfo_hook(struct addrinfo *result) {
 // injector is inactive (MOGATE_SOCKET unset) or already inside an injector
 // operation (mg_inside).
 
-// mg_exec_symbol resolves a real exec-family symbol, preferring the libsystem
-// resolver and falling back to RTLD_NEXT so the lookup skips our interposer.
-static void *mg_exec_symbol(const char *name) {
-	void *symbol = mg_next_symbol(name);
-	if (!symbol) symbol = dlsym(RTLD_NEXT, name);
-	return symbol;
-}
-
 static const char *mg_self_or_null(void) {
 	return mg_self_path[0] ? mg_self_path : NULL;
 }
 
 static int mg_execve_hook(const char *path, char *const argv[], char *const envp[]) {
-	static mg_sip_execve_fn real;
-	if (!real) real = (mg_sip_execve_fn)mg_exec_symbol("execve");
+	mg_sip_execve_fn real = mg_real_execve;
 	if (!real) { errno = ENOSYS; return -1; }
 	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(path, argv, envp);
 	// Bracket the detour with mg_inside so the patch it performs (reading the
@@ -2238,14 +2250,12 @@ static int mg_execve_hook(const char *path, char *const argv[], char *const envp
 }
 
 static int mg_execvp_hook(const char *file, char *const argv[]) {
-	static mg_sip_execvp_fn real_vp;
-	if (!real_vp) real_vp = (mg_sip_execvp_fn)mg_exec_symbol("execvp");
+	mg_sip_execvp_fn real_vp = mg_real_execvp;
 	if (mg_inside || !getenv("MOGATE_SOCKET")) {
 		if (!real_vp) { errno = ENOSYS; return -1; }
 		return real_vp(file, argv);
 	}
-	static mg_sip_execve_fn real_ve;
-	if (!real_ve) real_ve = (mg_sip_execve_fn)mg_exec_symbol("execve");
+	mg_sip_execve_fn real_ve = mg_real_execve;
 	if (!real_ve) {
 		if (!real_vp) { errno = ENOSYS; return -1; }
 		return real_vp(file, argv);
@@ -2261,8 +2271,7 @@ static int mg_execvp_hook(const char *file, char *const argv[]) {
 static int mg_posix_spawn_hook(pid_t *pid, const char *path,
 	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
 	char *const argv[], char *const envp[]) {
-	static mg_sip_spawn_fn real;
-	if (!real) real = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawn");
+	mg_sip_spawn_fn real = mg_real_posix_spawn;
 	if (!real) return ENOSYS;
 	if (mg_inside || !getenv("MOGATE_SOCKET")) return real(pid, path, fa, attr, argv, envp);
 	// See mg_execve_hook: mg_inside makes the patch's own file/exec re-entries
@@ -2277,14 +2286,12 @@ static int mg_posix_spawn_hook(pid_t *pid, const char *path,
 static int mg_posix_spawnp_hook(pid_t *pid, const char *file,
 	const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
 	char *const argv[], char *const envp[]) {
-	static mg_sip_spawn_fn real_p;
-	if (!real_p) real_p = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawnp");
+	mg_sip_spawn_fn real_p = mg_real_posix_spawnp;
 	if (mg_inside || !getenv("MOGATE_SOCKET")) {
 		if (!real_p) return ENOSYS;
 		return real_p(pid, file, fa, attr, argv, envp);
 	}
-	static mg_sip_spawn_fn real; // non-p: used after we PATH-resolve the target
-	if (!real) real = (mg_sip_spawn_fn)mg_exec_symbol("posix_spawn");
+	mg_sip_spawn_fn real = mg_real_posix_spawn; // non-p: used after we PATH-resolve the target
 	if (!real) {
 		if (!real_p) return ENOSYS;
 		return real_p(pid, file, fa, attr, argv, envp);
