@@ -79,7 +79,12 @@ type Config struct {
 	Logger *slog.Logger
 
 	// Stdin is the reader wired to the injected child's standard input. A nil
-	// reader selects os.Stdin, keeping the CLI/default path unchanged.
+	// reader selects os.Stdin, keeping the CLI/default path unchanged. When Pty is
+	// set, the caller SHOULD close Stdin (or cancel the run ctx) at teardown; a
+	// live reader that never reaches EOF -- an io.Pipe or a websocket bridge --
+	// would otherwise wedge the internal copy goroutine. As a backstop the
+	// injector closes an io.Closer Stdin on ctx cancel (and on child exit) to
+	// release that goroutine, so the caller must expect its Stdin to be closed.
 	Stdin io.Reader
 	// Stdout is the writer wired to the injected child's standard output. A nil
 	// writer selects os.Stdout, keeping the CLI/default path unchanged.
@@ -92,7 +97,9 @@ type Config struct {
 	// leader with that tty as its controlling terminal, wiring Stdin/Stdout to
 	// the pty master. It gives programs that require a real terminal (a shell,
 	// vim) a working tty, at the cost of merging stdout and stderr onto one
-	// stream. When false the child's streams are wired directly (default).
+	// stream. When false the child's streams are wired directly (default). When
+	// set, an io.Closer Stdin is closed at teardown (child exit or ctx cancel) to
+	// release the internal stdin copy goroutine; see the Stdin contract above.
 	Pty bool
 	// ResizeCh, when Pty is set, delivers terminal window sizes; each value
 	// resizes the pty. It is optional -- a nil channel leaves the pty at its
@@ -400,18 +407,24 @@ func resolveStreams(options injectionOptions) (stdin io.Reader, stdout io.Writer
 //     exits (its read then reports EOF/EIO), draining the final output;
 //   - the resize pump returns when pumpCtx is cancelled (child exit or a
 //     cancelled ctx) or when the caller closes ResizeCh;
-//   - the stdin->master pump returns when stdin reaches EOF/closes or a write to
-//     the closed master fails.
+//   - the stdin->master pump returns when stdin reaches EOF, when a write to the
+//     closed master fails, or when the stdin watcher closes an io.Closer stdin.
 //
-// The stdin pump is not joined: a caller-supplied stdin that never closes (e.g.
-// os.Stdin) must not wedge the return, so the caller releases it by closing its
-// reader at teardown; closing the master fails any in-flight write. Nothing here
-// closes ResizeCh -- the caller owns it.
+// A live stdin that never reaches EOF -- an io.Pipe or a websocket bridge, which
+// is honey's web-terminal case -- would otherwise wedge the stdin pump's Read
+// forever and leak on both child exit and a cancelled ctx, because the pump does
+// not itself watch pumpCtx. To bound it, a watcher closes an io.Closer stdin when
+// pumpCtx is cancelled (child exit or a cancelled ctx); io.Pipe, net.Conn and
+// os.File all abort an in-flight Read on Close. A stdin that is not an io.Closer
+// (e.g. bytes.Reader) is finite and returns EOF on its own, so it needs no
+// watcher and keeps its prior behavior. Nothing here closes ResizeCh -- the
+// caller owns it.
 //
 // The join order matters: the resize pump touches the master (pty.Setsize reads
 // its fd), so it is stopped and joined BEFORE the master is closed, ruling out a
-// Setsize/Close data race; the master is then closed to unblock the output pump,
-// which is joined last.
+// Setsize/Close data race; the master is then closed to unblock the output pump.
+// The stdin watcher and, when it is present, the stdin pump are joined last, so a
+// closable stdin leaves no goroutine behind on either exit path.
 func runWithPty(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.Writer, resize <-chan Winsize) error {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -450,10 +463,28 @@ func runWithPty(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.W
 		_, _ = io.Copy(stdout, ptmx)
 	}()
 
-	// input: stdin -> master. Intentionally not joined (see the doc comment).
+	// input: stdin -> master. The copy ends when stdin reaches EOF, when a write
+	// to the closed master fails, or -- for a live reader that never reaches EOF
+	// -- when the watcher below closes an io.Closer stdin.
+	inputDone := make(chan struct{})
 	go func() {
+		defer close(inputDone)
 		_, _ = io.Copy(ptmx, stdin)
 	}()
+
+	// stdin watcher: only a closable stdin can be unblocked, so the watcher (and
+	// the input-pump join) exist solely for that case. When pumpCtx is cancelled
+	// (child exit via stopPumps below, or a cancelled ctx) it closes the reader,
+	// aborting a blocked Read that would otherwise leak the input pump.
+	var watcherDone chan struct{}
+	if stdinCloser, ok := stdin.(io.Closer); ok {
+		watcherDone = make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			<-pumpCtx.Done()
+			_ = stdinCloser.Close()
+		}()
+	}
 
 	waitErr := cmd.Wait()
 	stopPumps()
@@ -463,6 +494,13 @@ func runWithPty(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.W
 	// the input pump.
 	_ = ptmx.Close()
 	<-outputDone
+	// Join the stdin watcher and, for a closable stdin, the input pump: the
+	// watcher has closed the reader and the master is closed, so both the pump's
+	// Read and any pending Write are now released -- no goroutine outlives return.
+	if watcherDone != nil {
+		<-watcherDone
+		<-inputDone
+	}
 	return waitErr
 }
 

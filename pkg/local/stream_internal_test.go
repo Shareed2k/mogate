@@ -162,6 +162,69 @@ func TestRunWithPty_CtxCancel(t *testing.T) {
 	}
 }
 
+// TestRunWithPty_BlockingStdinNoLeak is the regression for the stdin-pump leak:
+// a live stdin that never reaches EOF and is never closed by the caller (an
+// io.Pipe -- the shape honey's web-terminal bridge uses) must not leave the
+// input copy goroutine blocked on Read after the child exits. The test writes
+// nothing to the pipe and never closes either end; goleak proves the child-exit
+// path (the watcher closing the io.Closer stdin) released the pump, NOT the
+// caller. It runs on every platform because runWithPty drives a plain command.
+func TestRunWithPty_BlockingStdinNoLeak(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// pr blocks on Read until closed. The test writes nothing to pw and never
+	// closes either end -- deliberately, so goleak proves the child-exit teardown
+	// (the watcher closing the io.Closer stdin) released the input pump, not the
+	// caller. Closing pw here would run before the deferred goleak check (defers
+	// are LIFO) and mask the very leak this test guards.
+	pr, _ := io.Pipe()
+
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, "sh", "-c", "echo hi")
+	if err := runWithPty(ctx, cmd, pr, &out, nil); err != nil {
+		t.Fatalf("runWithPty returned %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "hi") {
+		t.Fatalf("output = %q, want it to contain %q", out.String(), "hi")
+	}
+}
+
+// TestRunWithPty_BlockingStdinCtxCancel is the ctx-cancel variant of the leak
+// regression: a long-running child with a live io.Pipe stdin that the test never
+// closes. Cancelling ctx must tear the session down promptly and leave no pump
+// behind -- the watcher closes the io.Closer stdin on pumpCtx cancel, releasing
+// the input pump without the caller touching the pipe.
+func TestRunWithPty_BlockingStdinCtxCancel(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// The test never writes pw nor closes either end (see the no-leak test): only
+	// the ctx-cancel teardown may release the input pump.
+	pr, _ := io.Pipe()
+
+	cmd := exec.CommandContext(ctx, "sleep", "60")
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithPty(ctx, cmd, pr, io.Discard, nil)
+	}()
+
+	// Give the child a moment to reach its pty before cancelling.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// Returned; goleak asserts the input pump and watcher are gone even
+		// though the test never closed the pipe.
+	case <-time.After(10 * time.Second):
+		t.Fatal("runWithPty did not return promptly after ctx cancel with a blocking stdin")
+	}
+}
+
 // resizeChan returns a buffered channel preloaded with size, so a test can feed
 // exactly one window size to the resize pump without blocking.
 func resizeChan(size Winsize) chan Winsize {
