@@ -2138,10 +2138,27 @@ static int mg_getaddrinfo_hook(const char *node, const char *service,
 		(hints && (hints->ai_flags & AI_NUMERICHOST))) {
 		return mg_real_getaddrinfo(node, service, hints, result);
 	}
-	char *end = NULL;
-	long port = service ? strtol(service, &end, 10) : 0;
-	if (service && (!end || *end || port < 0 || port > 65535)) {
-		return mg_real_getaddrinfo(node, service, hints, result);
+	// Parse the numeric port by hand instead of strtol: glibc 2.38 headers
+	// redirect strtol to __isoc23_strtol@GLIBC_2.38, which raises this shared
+	// object's glibc floor to 2.38 so it fails to load (ld.so/DYLD) on older
+	// targets (debian bookworm 2.36, ubuntu 22.04 2.35). A digit loop pulls no
+	// versioned libc symbol, keeping the injector loadable on any live glibc.
+	// Behaviour matches the old strtol end-pointer + range check: a NULL or
+	// empty service yields port 0, while a non-numeric service (e.g. "http"),
+	// a negative value, or one above 65535 falls through to the real resolver.
+	// (A leading '+' or whitespace, which strtol would have accepted, now
+	// defers to the real resolver too — no real port string carries either.)
+	long port = 0;
+	if (service) {
+		for (const char *p = service; *p; p++) {
+			if (*p < '0' || *p > '9') {
+				return mg_real_getaddrinfo(node, service, hints, result);
+			}
+			port = port * 10 + (*p - '0');
+			if (port > 65535) {
+				return mg_real_getaddrinfo(node, service, hints, result);
+			}
+		}
 	}
 	mg_inside++;
 	int fd = mg_agent_connection();
