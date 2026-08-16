@@ -154,6 +154,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) error {
 		return s.handleUDPMetadata(ctx, conn, string(frame.Payload))
 	case protocol.OpFileOpen:
 		return s.handleFile(conn, frame)
+	case protocol.OpEnvGet:
+		return s.handleEnv(conn)
 	default:
 		return s.respond(conn, frame.Operation, int32(syscall.ENOSYS), nil)
 	}
@@ -424,6 +426,35 @@ func (s *Server) handleDNS(ctx context.Context, conn net.Conn, host string) erro
 		lines = append(lines, address.IP.String())
 	}
 	return s.respond(conn, protocol.OpDNSLookup, 0, []byte(strings.Join(lines, "\n")))
+}
+
+// envProcPath is the environ file of PID 1 in the agent's PID namespace. honey
+// sets the ephemeral container's TargetContainerName so it shares the target's
+// PID namespace, making the target container's entrypoint PID 1 — reading this
+// file therefore returns the target container's own environment. It is a var so
+// tests can point it at a fixture instead of the real /proc.
+var envProcPath = "/proc/1/environ"
+
+// handleEnv returns the target container's environment as newline-separated
+// KEY=VALUE entries, read from PID 1 of the shared PID namespace (the target
+// container's entrypoint). A read failure is reported as a non-zero errno with
+// no payload: the local side treats a non-zero status as "skip overlay", so a
+// missing or unreadable environ must not be fatal to the agent.
+func (s *Server) handleEnv(conn net.Conn) error {
+	data, err := os.ReadFile(envProcPath)
+	if err != nil {
+		return s.respond(conn, protocol.OpEnvGet, errnoOf(err), nil)
+	}
+	entries := strings.Split(string(data), "\x00")
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "" {
+			continue
+		}
+		lines = append(lines, entry)
+	}
+	s.config.Logger.Debug("read target environment", "count", len(lines))
+	return s.respond(conn, protocol.OpEnvGet, 0, []byte(strings.Join(lines, "\n")))
 }
 
 func (s *Server) handleFile(conn net.Conn, openFrame protocol.Frame) error {

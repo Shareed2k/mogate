@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -178,6 +179,149 @@ func TestServer_ResolvePath(t *testing.T) {
 				t.Fatalf("resolvePath(%q)=%q, want %q", test.path, got, test.want)
 			}
 		})
+	}
+}
+
+func TestServer_HandleEnv(t *testing.T) {
+	server, err := NewHandler(Config{})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	originalPath := envProcPath
+	t.Cleanup(func() { envProcPath = originalPath })
+
+	tests := []struct {
+		name      string
+		environ   string
+		missing   bool
+		wantErrno bool
+		want      string
+	}{
+		{
+			name:    "serializes NUL-separated environ",
+			environ: "FOO=bar\x00BAZ=qux\x00",
+			want:    "FOO=bar\nBAZ=qux",
+		},
+		{
+			name:    "keeps embedded equals and empty values",
+			environ: "URL=https://x/?a=b\x00EMPTY=\x00",
+			want:    "URL=https://x/?a=b\nEMPTY=",
+		},
+		{
+			name:    "empty environ",
+			environ: "",
+			want:    "",
+		},
+		{
+			name:      "read failure yields non-zero status",
+			missing:   true,
+			wantErrno: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.missing {
+				envProcPath = filepath.Join(t.TempDir(), "does-not-exist")
+			} else {
+				path := filepath.Join(t.TempDir(), "environ")
+				if writeErr := os.WriteFile(path, []byte(test.environ), 0o600); writeErr != nil {
+					t.Fatalf("write environ fixture: %v", writeErr)
+				}
+				envProcPath = path
+			}
+
+			clientConn, serverConn := net.Pipe()
+			t.Cleanup(func() { _ = clientConn.Close() })
+			handleResult := make(chan error, 1)
+			go func() {
+				handleResult <- server.handleEnv(serverConn)
+				_ = serverConn.Close()
+			}()
+
+			if deadlineErr := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); deadlineErr != nil {
+				t.Fatalf("set deadline: %v", deadlineErr)
+			}
+			frame, readErr := protocol.ReadFrame(clientConn)
+			if readErr != nil {
+				t.Fatalf("read response: %v", readErr)
+			}
+			if handleErr := <-handleResult; handleErr != nil {
+				t.Fatalf("handleEnv: %v", handleErr)
+			}
+			if frame.Operation != protocol.OpEnvGet {
+				t.Fatalf("operation=%d, want %d", frame.Operation, protocol.OpEnvGet)
+			}
+			errno, data, statusErr := protocol.ParseStatus(frame.Payload)
+			if statusErr != nil {
+				t.Fatalf("parse status: %v", statusErr)
+			}
+			if test.wantErrno {
+				if errno == 0 {
+					t.Fatalf("errno=0, want non-zero on read failure")
+				}
+				if len(data) != 0 {
+					t.Fatalf("data=%q, want empty payload on read failure", data)
+				}
+				return
+			}
+			if errno != 0 {
+				t.Fatalf("errno=%d, want 0", errno)
+			}
+			if string(data) != test.want {
+				t.Fatalf("env=%q, want %q", data, test.want)
+			}
+		})
+	}
+}
+
+func TestServer_HandleUnknownOp(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewHandler(Config{})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() { _ = clientConn.Close() })
+	handleResult := make(chan error, 1)
+	go func() {
+		handleResult <- server.handle(context.Background(), serverConn)
+		_ = serverConn.Close()
+	}()
+
+	const unknownOp = protocol.Operation(200)
+	writeResult := make(chan error, 1)
+	go func() {
+		writeResult <- protocol.WriteFrame(clientConn, protocol.Frame{Operation: unknownOp})
+	}()
+
+	if deadlineErr := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); deadlineErr != nil {
+		t.Fatalf("set deadline: %v", deadlineErr)
+	}
+	frame, readErr := protocol.ReadFrame(clientConn)
+	if readErr != nil {
+		t.Fatalf("read response: %v", readErr)
+	}
+	if writeErr := <-writeResult; writeErr != nil {
+		t.Fatalf("write request: %v", writeErr)
+	}
+	if handleErr := <-handleResult; handleErr != nil {
+		t.Fatalf("handle: %v", handleErr)
+	}
+	if frame.Operation != unknownOp {
+		t.Fatalf("operation=%d, want %d", frame.Operation, unknownOp)
+	}
+	errno, data, statusErr := protocol.ParseStatus(frame.Payload)
+	if statusErr != nil {
+		t.Fatalf("parse status: %v", statusErr)
+	}
+	if errno != int32(syscall.ENOSYS) {
+		t.Fatalf("errno=%d, want ENOSYS(%d)", errno, int32(syscall.ENOSYS))
+	}
+	if len(data) != 0 {
+		t.Fatalf("data=%q, want empty", data)
 	}
 }
 
