@@ -3,6 +3,7 @@ module github.com/shareed2k/mogate
 go 1.24
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/google/nftables v0.3.0
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/goleak v1.3.0

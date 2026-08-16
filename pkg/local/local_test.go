@@ -1,6 +1,7 @@
 package local_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -228,5 +229,86 @@ func TestRun_IncomingRequiresTarget(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "target") {
 		t.Fatalf("error = %v, want it to mention the missing target", err)
+	}
+}
+
+// TestRun_CustomStdout asserts that a caller-supplied Stdout (with Pty off)
+// receives the injected child's output, exercising the stdio seam end to end
+// through Run without disturbing the default stdin/stderr wiring.
+func TestRun_CustomStdout(t *testing.T) {
+	skipInjectedSpawnOnDarwin(t)
+	defer goleak.VerifyNone(t)
+
+	dir := t.TempDir()
+	socket := shortSocketPath(t)
+	library := filepath.Join(dir, "libmogate.test")
+	tokenFile := filepath.Join(dir, "token")
+	writeFile(t, library, "dummy injector")
+	writeFile(t, tokenFile, validToken)
+
+	egress := idleListener(t)
+	defer func() { _ = egress.Close() }()
+
+	var out bytes.Buffer
+	cfg := local.Config{
+		EgressAddr:  egress.Addr().String(),
+		TokenFile:   tokenFile,
+		Socket:      socket,
+		InjectorLib: library,
+		Modes:       local.Modes{Egress: true},
+		Stdout:      &out,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := local.Run(ctx, cfg, []string{"sh", "-c", "echo hi"}); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "hi") {
+		t.Fatalf("custom stdout = %q, want it to contain %q", out.String(), "hi")
+	}
+}
+
+// TestRun_PtyStreamsAndResizes asserts that with Pty set the child runs on a
+// pseudo-terminal whose output reaches the caller's Stdout, that a window size
+// delivered on ResizeCh is drained without deadlock, and that no pump goroutine
+// outlives the command. Stdin is an empty reader so the input pump ends at once.
+func TestRun_PtyStreamsAndResizes(t *testing.T) {
+	skipInjectedSpawnOnDarwin(t)
+	defer goleak.VerifyNone(t)
+
+	dir := t.TempDir()
+	socket := shortSocketPath(t)
+	library := filepath.Join(dir, "libmogate.test")
+	tokenFile := filepath.Join(dir, "token")
+	writeFile(t, library, "dummy injector")
+	writeFile(t, tokenFile, validToken)
+
+	egress := idleListener(t)
+	defer func() { _ = egress.Close() }()
+
+	resize := make(chan local.Winsize, 1)
+	resize <- local.Winsize{Rows: 24, Cols: 80}
+
+	var out bytes.Buffer
+	cfg := local.Config{
+		EgressAddr:  egress.Addr().String(),
+		TokenFile:   tokenFile,
+		Socket:      socket,
+		InjectorLib: library,
+		Modes:       local.Modes{Egress: true},
+		Stdin:       bytes.NewReader(nil),
+		Stdout:      &out,
+		Pty:         true,
+		ResizeCh:    resize,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := local.Run(ctx, cfg, []string{"sh", "-c", "echo hi"}); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "hi") {
+		t.Fatalf("pty stdout = %q, want it to contain %q", out.String(), "hi")
 	}
 }

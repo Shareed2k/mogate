@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -23,6 +24,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/creack/pty"
 
 	"github.com/shareed2k/mogate/internal/egress"
 	"github.com/shareed2k/mogate/internal/incoming"
@@ -74,6 +77,37 @@ type Config struct {
 	Modes Modes
 	// Logger receives session diagnostics. A nil logger writes to stderr.
 	Logger *slog.Logger
+
+	// Stdin is the reader wired to the injected child's standard input. A nil
+	// reader selects os.Stdin, keeping the CLI/default path unchanged.
+	Stdin io.Reader
+	// Stdout is the writer wired to the injected child's standard output. A nil
+	// writer selects os.Stdout, keeping the CLI/default path unchanged.
+	Stdout io.Writer
+	// Stderr is the writer wired to the injected child's standard error. A nil
+	// writer selects os.Stderr, keeping the CLI/default path unchanged. When Pty
+	// is set the child's stderr is folded into the pty, so this is not wired.
+	Stderr io.Writer
+	// Pty, when set, allocates a pseudo-terminal and runs the child as a session
+	// leader with that tty as its controlling terminal, wiring Stdin/Stdout to
+	// the pty master. It gives programs that require a real terminal (a shell,
+	// vim) a working tty, at the cost of merging stdout and stderr onto one
+	// stream. When false the child's streams are wired directly (default).
+	Pty bool
+	// ResizeCh, when Pty is set, delivers terminal window sizes; each value
+	// resizes the pty. It is optional -- a nil channel leaves the pty at its
+	// default size. The caller owns and closes the channel; execute never does.
+	ResizeCh <-chan Winsize
+}
+
+// Winsize is a terminal window size in character cells. It is the exported,
+// dependency-free form a caller uses to drive Config.ResizeCh without importing
+// the pty package.
+type Winsize struct {
+	// Rows is the terminal height in character cells.
+	Rows uint16
+	// Cols is the terminal width in character cells.
+	Cols uint16
 }
 
 // Modes selects which capabilities participate in an Injection Session.
@@ -181,6 +215,11 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 			libraryRosetta: cfg.InjectorLibRosetta,
 			files:          cfg.Modes.Files && cfg.Root != "",
 			targetEnv:      targetEnv,
+			stdin:          cfg.Stdin,
+			stdout:         cfg.Stdout,
+			stderr:         cfg.Stderr,
+			pty:            cfg.Pty,
+			resize:         cfg.ResizeCh,
 		}, command)
 	}})
 	return session.Run(runCtx, tasks...)
@@ -214,6 +253,18 @@ type injectionOptions struct {
 	// onto the child. A nil map (Modes.Env off, or a failed/empty fetch) leaves
 	// the injected environment byte-identical to the no-overlay behavior.
 	targetEnv map[string]string
+	// stdin, stdout, and stderr are the optional caller-supplied streams for the
+	// child. A nil value resolves to the matching os.Std* file (see
+	// resolveStreams), keeping the default path byte-identical.
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+	// pty allocates a pseudo-terminal for the child and pumps its I/O over the
+	// resolved stdin/stdout; when false the streams are wired directly.
+	pty bool
+	// resize delivers terminal window sizes while pty is set. It is optional and
+	// owned by the caller; a nil channel leaves the pty at its default size.
+	resize <-chan Winsize
 }
 
 // selectInjector picks the injector matching the slice command[0] was thinned
@@ -293,18 +344,126 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 	}
 	cmd := exec.CommandContext(ctx, execPath)
 	cmd.Args = argv
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = injectedEnvironment(os.Environ(), options, library)
-	if err := cmd.Run(); err != nil {
+
+	// Resolve the effective streams once. With all three nil (the CLI/default
+	// path) they are exactly os.Stdin/os.Stdout/os.Stderr, so the wiring below is
+	// byte-identical to the historical behavior.
+	stdin, stdout, stderr := resolveStreams(options)
+
+	var runErr error
+	if options.pty {
+		// A pty exposes a single tty: the child's stdin, stdout, and stderr are
+		// all the slave, so stderr is folded into stdout and not wired separately.
+		runErr = runWithPty(ctx, cmd, stdin, stdout, options.resize)
+	} else {
+		cmd.Stdin = stdin
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		runErr = cmd.Run()
+	}
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			return fmt.Errorf("command exited with status %d", exitErr.ExitCode())
 		}
-		return fmt.Errorf("run command: %w", err)
+		return fmt.Errorf("run command: %w", runErr)
 	}
 	return nil
+}
+
+// resolveStreams returns the effective child streams, substituting the matching
+// os.Std* file for each nil stream. Keeping the defaulting in one place makes
+// the no-stream path (all three nil) provably identical to os.Std* wiring.
+func resolveStreams(options injectionOptions) (stdin io.Reader, stdout io.Writer, stderr io.Writer) {
+	stdin, stdout, stderr = options.stdin, options.stdout, options.stderr
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	return stdin, stdout, stderr
+}
+
+// runWithPty starts cmd on a freshly allocated pseudo-terminal (creack/pty sets
+// Setsid+Setctty and wires the child's std fds to the slave) and pumps its I/O
+// to the supplied streams. It returns the child's raw wait error; execute maps a
+// non-zero exit to the "command exited with status N" message, keeping that
+// mapping single-sourced.
+//
+// Every goroutine is bounded by the child's lifetime:
+//   - the master->stdout pump returns once the master is closed after the child
+//     exits (its read then reports EOF/EIO), draining the final output;
+//   - the resize pump returns when pumpCtx is cancelled (child exit or a
+//     cancelled ctx) or when the caller closes ResizeCh;
+//   - the stdin->master pump returns when stdin reaches EOF/closes or a write to
+//     the closed master fails.
+//
+// The stdin pump is not joined: a caller-supplied stdin that never closes (e.g.
+// os.Stdin) must not wedge the return, so the caller releases it by closing its
+// reader at teardown; closing the master fails any in-flight write. Nothing here
+// closes ResizeCh -- the caller owns it.
+//
+// The join order matters: the resize pump touches the master (pty.Setsize reads
+// its fd), so it is stopped and joined BEFORE the master is closed, ruling out a
+// Setsize/Close data race; the master is then closed to unblock the output pump,
+// which is joined last.
+func runWithPty(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.Writer, resize <-chan Winsize) error {
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("start command with pty: %w", err)
+	}
+
+	// pumpCtx bounds the resize pump to the child's lifetime: it is cancelled on
+	// child exit below, and also when the caller cancels ctx.
+	pumpCtx, stopPumps := context.WithCancel(ctx)
+	defer stopPumps()
+
+	// resize: apply window sizes until the child exits, ctx is cancelled, or the
+	// caller closes ResizeCh. A nil resize channel never fires, so the pump then
+	// waits solely on pumpCtx.
+	resizeDone := make(chan struct{})
+	go func() {
+		defer close(resizeDone)
+		for {
+			select {
+			case <-pumpCtx.Done():
+				return
+			case ws, ok := <-resize:
+				if !ok {
+					return
+				}
+				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols})
+			}
+		}
+	}()
+
+	// output: master -> stdout, draining the child's output until the master is
+	// closed after it exits.
+	outputDone := make(chan struct{})
+	go func() {
+		defer close(outputDone)
+		_, _ = io.Copy(stdout, ptmx)
+	}()
+
+	// input: stdin -> master. Intentionally not joined (see the doc comment).
+	go func() {
+		_, _ = io.Copy(ptmx, stdin)
+	}()
+
+	waitErr := cmd.Wait()
+	stopPumps()
+	<-resizeDone // no pty.Setsize is in flight once this returns
+	// Closing the master unblocks the output pump's read (it reports EOF/EIO even
+	// if a grandchild still holds the slave open) and fails any pending write from
+	// the input pump.
+	_ = ptmx.Close()
+	<-outputDone
+	return waitErr
 }
 
 // assembleExec builds the (execPath, argv) pair execute runs. For the non-script
