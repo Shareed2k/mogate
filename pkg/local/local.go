@@ -14,14 +14,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/shareed2k/mogate/internal/egress"
 	"github.com/shareed2k/mogate/internal/incoming"
+	"github.com/shareed2k/mogate/internal/protocol"
 	"github.com/shareed2k/mogate/internal/session"
 	"github.com/shareed2k/mogate/internal/sessiontransport"
 )
@@ -57,6 +62,14 @@ type Config struct {
 	// MaxConnections bounds concurrent connections. A value of zero or less
 	// selects the internal default of 256.
 	MaxConnections int
+	// EnvInclude, when non-empty, restricts the target environment overlay
+	// (Modes.Env) to exactly these keys. An empty slice overlays every target
+	// key that survives the default and EnvExclude filters.
+	EnvInclude []string
+	// EnvExclude names additional target environment keys to drop from the
+	// overlay, on top of the built-in defaults that protect local execution
+	// and toolchain paths.
+	EnvExclude []string
 	// Modes selects which capabilities are active for the session.
 	Modes Modes
 	// Logger receives session diagnostics. A nil logger writes to stderr.
@@ -71,6 +84,9 @@ type Modes struct {
 	Incoming bool
 	// Files enables remote file redirection for the injected command.
 	Files bool
+	// Env overlays the target container's environment onto the spawned child,
+	// filtered by the built-in defaults plus Config.EnvInclude/EnvExclude.
+	Env bool
 }
 
 // Run establishes the local egress relay, attaches the incoming tunnels when
@@ -111,6 +127,22 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 		return err
 	}
 
+	// The target environment overlay is best-effort: it is fetched synchronously
+	// here, after the relay socket is ready and before the command is spawned, so
+	// a slow or failed fetch can never race or block the child. A failure leaves
+	// targetEnv nil and the child runs with no overlay -- exactly as when Env is
+	// off. Values are never logged; only a count is emitted at debug.
+	var targetEnv map[string]string
+	if cfg.Modes.Env {
+		fetched, fetchErr := fetchTargetEnv(runCtx, cfg.Socket)
+		if fetchErr != nil {
+			logger.Debug("skipping target environment overlay", "error", fetchErr)
+		} else {
+			targetEnv = filterEnv(fetched, cfg.EnvInclude, cfg.EnvExclude)
+			logger.Debug("prepared target environment overlay", "count", len(targetEnv))
+		}
+	}
+
 	tasks := []session.Task{
 		{Name: "outbound relay", Run: func(taskCtx context.Context) error {
 			stopped := make(chan struct{})
@@ -148,6 +180,7 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 			library:        cfg.InjectorLib,
 			libraryRosetta: cfg.InjectorLibRosetta,
 			files:          cfg.Modes.Files && cfg.Root != "",
+			targetEnv:      targetEnv,
 		}, command)
 	}})
 	return session.Run(runCtx, tasks...)
@@ -177,6 +210,10 @@ type injectionOptions struct {
 	library        string
 	libraryRosetta string
 	files          bool
+	// targetEnv is the already-filtered target container environment overlaid
+	// onto the child. A nil map (Modes.Env off, or a failed/empty fetch) leaves
+	// the injected environment byte-identical to the no-overlay behavior.
+	targetEnv map[string]string
 }
 
 // selectInjector picks the injector matching the slice command[0] was thinned
@@ -297,6 +334,14 @@ func assembleExec(origArg0 string, command []string, res sipResult) (execPath st
 // and platform loader variable pointing at library.
 func injectedEnvironment(base []string, options injectionOptions, library string) []string {
 	env := append([]string(nil), base...)
+	// Overlay the filtered target environment first, so remote values win over a
+	// local var of the same name, while the MOGATE_*/loader variables set below
+	// still win over any same-named target value. Keys are applied in sorted
+	// order for a reproducible child environment. A nil map is a no-op, keeping
+	// the no-overlay path byte-identical.
+	for _, key := range slices.Sorted(maps.Keys(options.targetEnv)) {
+		env = setEnv(env, key, options.targetEnv[key])
+	}
 	env = setEnv(env, "MOGATE_SOCKET", options.socket)
 	if options.files {
 		env = setEnv(env, "MOGATE_FILE_MODE", "remote")
@@ -352,4 +397,140 @@ func envValue(env []string, key string) string {
 		}
 	}
 	return ""
+}
+
+// envFetchTimeout bounds the best-effort target environment fetch so a
+// wedged relay or agent can never stall the command it precedes.
+const envFetchTimeout = 10 * time.Second
+
+// bundlerOrigPrefix marks the variables Bundler saves off before rewriting the
+// execution environment (BUNDLER_ORIG_PATH, BUNDLER_ORIG_GEM_HOME, ...). They
+// describe the target's own toolchain paths and must never leak onto the child.
+const bundlerOrigPrefix = "BUNDLER_ORIG_"
+
+// defaultEnvExclude is the set of target environment keys that are always kept
+// local. They select executables, interpreters, and language toolchain paths,
+// so importing the target's values would make the child resolve the wrong
+// binaries or libraries. Callers extend it through Config.EnvExclude.
+var defaultEnvExclude = map[string]struct{}{
+	"PATH":              {},
+	"HOME":              {},
+	"HOMEPATH":          {},
+	"CLASSPATH":         {},
+	"JAVA_EXE":          {},
+	"JAVA_HOME":         {},
+	"JAVA_TOOL_OPTIONS": {},
+	"_JAVA_OPTIONS":     {},
+	"CATALINA_HOME":     {},
+	"GEM_HOME":          {},
+	"GEM_PATH":          {},
+	"GOPATH":            {},
+	"PYTHONPATH":        {},
+	"BUNDLE_PATH":       {},
+	"BUNDLE_BIN_PATH":   {},
+	"BUNDLE_GEM_PATH":   {},
+}
+
+// filterEnv selects the target environment variables that may be overlaid onto
+// the spawned child. When include is non-empty only those keys are candidates;
+// otherwise every key is a candidate. A key is then dropped when it is in the
+// default exclude set, in exclude, or carries the BUNDLER_ORIG_ prefix, so the
+// child always keeps its own execution and toolchain paths. The returned map is
+// fresh and target is never mutated.
+func filterEnv(target map[string]string, include, exclude []string) map[string]string {
+	includeSet := toSet(include)
+	excludeSet := toSet(exclude)
+	filtered := make(map[string]string, len(target))
+	for key, value := range target {
+		if len(includeSet) > 0 {
+			if _, ok := includeSet[key]; !ok {
+				continue
+			}
+		}
+		if _, ok := defaultEnvExclude[key]; ok {
+			continue
+		}
+		if _, ok := excludeSet[key]; ok {
+			continue
+		}
+		if strings.HasPrefix(key, bundlerOrigPrefix) {
+			continue
+		}
+		filtered[key] = value
+	}
+	return filtered
+}
+
+// toSet turns keys into a lookup set, ignoring empty entries.
+func toSet(keys []string) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		set[key] = struct{}{}
+	}
+	return set
+}
+
+// fetchTargetEnv asks the in-Pod agent for the target container's environment
+// over the relay Unix socket via the M1 OpEnvGet operation, reusing the same
+// frame round-trip the injector speaks. It is synchronous and bounded by
+// envFetchTimeout, spawns no goroutine, and returns the parsed KEY=VALUE
+// entries. Every failure (dial, frame, parse, or a non-zero agent status) is
+// returned so the caller can log it at debug and skip the overlay; it never
+// logs environment values.
+func fetchTargetEnv(ctx context.Context, socket string) (map[string]string, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, envFetchTimeout)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(fetchCtx, "unix", socket)
+	if err != nil {
+		return nil, fmt.Errorf("dial relay socket: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := fetchCtx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	if err := protocol.WriteFrame(conn, protocol.Frame{Operation: protocol.OpEnvGet}); err != nil {
+		return nil, fmt.Errorf("request target environment: %w", err)
+	}
+	frame, err := protocol.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read target environment: %w", err)
+	}
+	errno, data, err := protocol.ParseStatus(frame.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("parse target environment status: %w", err)
+	}
+	if errno != 0 {
+		return nil, fmt.Errorf("agent reported errno %d for target environment", errno)
+	}
+	return parseEnvPayload(data), nil
+}
+
+// parseEnvPayload turns the agent's newline-separated KEY=VALUE payload into a
+// map. Entries without a '=' or with an empty key are skipped; a value may
+// itself contain '=' (only the first is the separator). It never logs values.
+func parseEnvPayload(data []byte) map[string]string {
+	result := make(map[string]string)
+	if len(data) == 0 {
+		return result
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found || key == "" {
+			continue
+		}
+		result[key] = value
+	}
+	return result
 }
