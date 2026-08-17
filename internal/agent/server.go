@@ -192,6 +192,8 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 	defer close(stopped)
 
 	receiveResult := make(chan error, 1)
+	dnsSources := make(map[netip.AddrPort]netip.AddrPort)
+	var dnsSourcesMu sync.RWMutex
 	go func() {
 		buffer := make([]byte, 64<<10)
 		for {
@@ -200,7 +202,10 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 				receiveResult <- readErr
 				return
 			}
-			payload, encodeErr := protocol.AppendAddress(nil, source)
+			dnsSourcesMu.RLock()
+			reportedSource := reportedDNSAddrPort(dnsSources, source)
+			dnsSourcesMu.RUnlock()
+			payload, encodeErr := protocol.AppendAddress(nil, reportedSource)
 			if encodeErr != nil {
 				receiveResult <- encodeErr
 				return
@@ -234,7 +239,13 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 		if parseErr != nil {
 			return parseErr
 		}
+		requestedDestination := destination
 		destination = s.rewriteDNSAddrPort(destination)
+		if destination != requestedDestination {
+			dnsSourcesMu.Lock()
+			dnsSources[destination] = requestedDestination
+			dnsSourcesMu.Unlock()
+		}
 		metadata := protocol.DatagramMetadata{}
 		if frame.Operation == protocol.OpUDPSendMsg {
 			parsedMetadata, consumedMetadata, metadataErr := protocol.ParseDatagramMetadata(frame.Payload[consumed:])
@@ -256,6 +267,7 @@ func (s *Server) handleUnconnectedUDP(ctx context.Context, client net.Conn, with
 }
 
 func (s *Server) handleUDPMetadata(ctx context.Context, client net.Conn, address string) error {
+	requestedAddress, _ := netip.ParseAddrPort(address)
 	address = s.rewriteDNSAddress(address)
 	remoteAddress, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
@@ -291,7 +303,11 @@ func (s *Server) handleUDPMetadata(ctx context.Context, client net.Conn, address
 				receiveResult <- readErr
 				return
 			}
-			payload, encodeErr := protocol.AppendAddress(nil, source)
+			reportedSource := source
+			if requestedAddress.IsValid() && remoteAddress.AddrPort() != requestedAddress {
+				reportedSource = requestedAddress
+			}
+			payload, encodeErr := protocol.AppendAddress(nil, reportedSource)
 			if encodeErr == nil {
 				payload, encodeErr = protocol.AppendDatagramMetadata(payload, metadata)
 			}

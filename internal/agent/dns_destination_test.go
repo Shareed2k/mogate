@@ -25,3 +25,18 @@ func TestRewriteDNSDestination(t *testing.T) {
 		t.Fatalf("non-DNS destination=%s, want %s", got, unchanged)
 	}
 }
+
+func TestReportedDNSAddrPort(t *testing.T) {
+	t.Parallel()
+	rewritten := netip.MustParseAddrPort("10.96.0.10:53")
+	requested := netip.MustParseAddrPort("192.0.2.53:53")
+	other := netip.MustParseAddrPort("192.0.2.80:8080")
+	rewrites := map[netip.AddrPort]netip.AddrPort{rewritten: requested}
+
+	if got := reportedDNSAddrPort(rewrites, rewritten); got != requested {
+		t.Fatalf("reported source = %s, want %s", got, requested)
+	}
+	if got := reportedDNSAddrPort(rewrites, other); got != other {
+		t.Fatalf("unrelated source = %s, want %s", got, other)
+	}
+}

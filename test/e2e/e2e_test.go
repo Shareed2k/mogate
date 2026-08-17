@@ -144,6 +144,53 @@ func TestK3sE2E(t *testing.T) {
 		waitStopped(t, localServer, localLog)
 	})
 
+	t.Run("incoming tcp and udp steal into docker", func(t *testing.T) {
+		control := fmt.Sprintf("host.testcontainers.internal:%d", incomingPort)
+		script := strings.Join([]string{
+			"set -eu",
+			"mogate-fixture server --address 127.0.0.1:18080 --response docker-local &",
+			"fixture_pid=$!",
+			"trap 'kill $fixture_pid 2>/dev/null || true' EXIT INT TERM",
+			"until mogate-fixture request --network tcp --address 127.0.0.1:18080 --timeout 100ms >/dev/null 2>&1; do sleep 0.05; done",
+			"for attempt in $(seq 1 50); do",
+			"  mogate incoming --udp --control \"$CONTROL_ADDR\" --target 127.0.0.1:18080 && exit 0",
+			"  sleep 0.1",
+			"done",
+			"exit 1",
+		}, "\n")
+		localContainer, err := testcontainers.Run(ctx, toolboxImage,
+			testcontainers.WithEntrypoint("/bin/sh", "-c"),
+			testcontainers.WithCmd(script),
+			testcontainers.WithEnv(map[string]string{
+				"CONTROL_ADDR": control,
+				"MOGATE_TOKEN": testToken,
+			}),
+			testcontainers.WithHostConfigModifier(func(config *container.HostConfig) {
+				config.ExtraHosts = append(config.ExtraHosts, "host.testcontainers.internal:host-gateway")
+			}),
+		)
+		if err != nil {
+			t.Fatalf("start Docker incoming target: %v", err)
+		}
+		testcontainers.CleanupContainer(t, localContainer)
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			logs, logErr := localContainer.Logs(context.Background())
+			if logErr != nil {
+				t.Logf("Docker incoming logs unavailable: %v", logErr)
+				return
+			}
+			defer logs.Close()
+			body, _ := io.ReadAll(logs)
+			t.Logf("Docker incoming logs:\n%s", body)
+		})
+
+		assertClusterRequestEventually(t, ctx, kubeconfig, "tcp", "mogate-target:8080", "docker-local")
+		assertClusterRequestEventually(t, ctx, kubeconfig, "udp", "mogate-target:8080", "docker-local")
+	})
+
 	t.Run("injected cluster dns and tcp egress", func(t *testing.T) {
 		output := runDevClient(t, ctx, root, nativeClient, incomingPort, egressPort, "--udp=false", "tcp")
 		if !strings.Contains(output, "remote-cluster-api") {
@@ -204,7 +251,7 @@ func TestK3sE2E(t *testing.T) {
 			},
 			{name: "curl http", command: []string{"curl", "--fail", "--silent", "http://cluster-api.default.svc.cluster.local:8080/"}, want: "remote-cluster-api"},
 			{name: "wget http", command: []string{"wget", "-qO-", "http://cluster-api.default.svc.cluster.local:8080/"}, want: "remote-cluster-api"},
-			{name: "telnet tcp", command: []string{"bash", "-c", "printf probe | telnet cluster-api.default.svc.cluster.local 8080"}, want: "remote-cluster-api"},
+			{name: "telnet tcp", command: []string{"bash", "-c", "{ printf probe; sleep 1; } | telnet cluster-api.default.svc.cluster.local 8080"}, want: "remote-cluster-api"},
 			{name: "dig udp", command: []string{"bash", "-c", "answer=$(dig +short cluster-api.default.svc.cluster.local); test -n \"$answer\"; printf %s \"$answer\""}, want: "."},
 			{name: "dig tcp", command: []string{"bash", "-c", "answer=$(dig +tcp +short cluster-api.default.svc.cluster.local); test -n \"$answer\"; printf %s \"$answer\""}, want: "."},
 		}
@@ -263,7 +310,7 @@ func runToolbox(t *testing.T, ctx context.Context, control, egress string, comma
 func runDevClient(t *testing.T, ctx context.Context, root, client string, incomingPort, egressPort int, udpFlag, network string) string {
 	t.Helper()
 	args := []string{
-		"dev", "--files=false", udpFlag,
+		"dev", "--files=false", "--incoming=false", udpFlag,
 		"--control", fmt.Sprintf("127.0.0.1:%d", incomingPort),
 		"--egress-control", fmt.Sprintf("127.0.0.1:%d", egressPort),
 		"--target", "127.0.0.1:1", "--", client, network,
