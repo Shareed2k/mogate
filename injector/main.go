@@ -78,6 +78,8 @@ typedef int (*dup2_fn)(int, int);
 typedef int (*fcntl_fn)(int, int, ...);
 typedef int (*getsockopt_fn)(int, int, int, void *, socklen_t *);
 typedef int (*setsockopt_fn)(int, int, int, const void *, socklen_t);
+typedef int (*getsockname_fn)(int, struct sockaddr *, socklen_t *);
+typedef int (*getpeername_fn)(int, struct sockaddr *, socklen_t *);
 typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
 typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
 typedef ssize_t (*recvmsg_fn)(int, struct msghdr *, int);
@@ -147,6 +149,8 @@ static dup2_fn mg_real_dup2;
 static fcntl_fn mg_real_fcntl;
 static getsockopt_fn mg_real_getsockopt;
 static setsockopt_fn mg_real_setsockopt;
+static getsockname_fn mg_real_getsockname;
+static getpeername_fn mg_real_getpeername;
 static poll_fn mg_real_poll;
 static sendmsg_fn mg_real_sendmsg;
 static recvmsg_fn mg_real_recvmsg;
@@ -292,6 +296,8 @@ static void mg_resolve_symbols_once(void) {
 	mg_real_fstat = (fstat_fn)mg_next_symbol("fstat");
 	mg_real_getaddrinfo = (getaddrinfo_fn)mg_next_symbol("getaddrinfo");
 	mg_real_freeaddrinfo = (freeaddrinfo_fn)mg_next_symbol("freeaddrinfo");
+	mg_real_getsockname = (getsockname_fn)mg_next_symbol("getsockname");
+	mg_real_getpeername = (getpeername_fn)mg_next_symbol("getpeername");
 
 #ifdef __APPLE__
 	mg_real_dup = mg_raw_dup;
@@ -328,7 +334,8 @@ static int mg_symbols(void) {
 		!mg_real_send || !mg_real_recv || !mg_real_sendto || !mg_real_recvfrom ||
 		!mg_real_close || !mg_real_open || !mg_real_lseek || !mg_real_fstat ||
 		!mg_real_getaddrinfo || !mg_real_freeaddrinfo || !mg_real_dup ||
-		!mg_real_dup2 || !mg_real_fcntl || !mg_real_getsockopt || !mg_real_setsockopt || !mg_real_poll ||
+		!mg_real_dup2 || !mg_real_fcntl || !mg_real_getsockopt || !mg_real_setsockopt ||
+		!mg_real_getsockname || !mg_real_getpeername || !mg_real_poll ||
 		!mg_real_sendmsg || !mg_real_recvmsg || !mg_real_select) {
 		errno = ENOSYS;
 		return -1;
@@ -1605,6 +1612,38 @@ static int mg_select_hook(int descriptor_count, fd_set *read_set, fd_set *write_
 	return result;
 }
 
+static int mg_copy_socket_address(const struct sockaddr *source, socklen_t source_size,
+	struct sockaddr *destination, socklen_t *destination_size) {
+	if (!destination || !destination_size) { errno = EFAULT; return -1; }
+	socklen_t copied = *destination_size < source_size ? *destination_size : source_size;
+	memcpy(destination, source, copied);
+	*destination_size = source_size;
+	return 0;
+}
+
+static int mg_getsockname_hook(int fd, struct sockaddr *address, socklen_t *address_size) {
+	if (mg_inside || mg_symbols() < 0)
+		return mg_real_getsockname ? mg_real_getsockname(fd, address, address_size) : -1;
+	struct mg_virtual_descriptor *descriptor = mg_descriptor_for(fd);
+	if (!descriptor || !descriptor->peer_size)
+		return mg_real_getsockname(fd, address, address_size);
+	struct sockaddr_storage local;
+	memset(&local, 0, sizeof(local));
+	local.ss_family = descriptor->peer.ss_family;
+	socklen_t local_size = local.ss_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+	return mg_copy_socket_address((const struct sockaddr *)&local, local_size, address, address_size);
+}
+
+static int mg_getpeername_hook(int fd, struct sockaddr *address, socklen_t *address_size) {
+	if (mg_inside || mg_symbols() < 0)
+		return mg_real_getpeername ? mg_real_getpeername(fd, address, address_size) : -1;
+	struct mg_virtual_descriptor *descriptor = mg_descriptor_for(fd);
+	if (!descriptor) return mg_real_getpeername(fd, address, address_size);
+	if (!descriptor->peer_size) { errno = ENOTCONN; return -1; }
+	return mg_copy_socket_address((const struct sockaddr *)&descriptor->peer,
+		descriptor->peer_size, address, address_size);
+}
+
 static int mg_getsockopt_hook(int fd, int level, int option, void *value, socklen_t *size) {
 	if (mg_inside || mg_symbols() < 0) return mg_real_getsockopt ? mg_real_getsockopt(fd, level, option, value, size) : -1;
 	struct mg_virtual_descriptor *descriptor = mg_descriptor_for(fd);
@@ -2383,6 +2422,8 @@ __attribute__((visibility("default"))) int epoll_wait(int epoll_fd, struct epoll
 __attribute__((visibility("default"))) int epoll_pwait(int epoll_fd, struct epoll_event *events, int maximum, int timeout, const sigset_t *mask) { return mg_epoll_pwait_hook(epoll_fd, events, maximum, timeout, mask); }
 __attribute__((visibility("default"))) int getsockopt(int fd, int level, int option, void *value, socklen_t *size) { return mg_getsockopt_hook(fd, level, option, value, size); }
 __attribute__((visibility("default"))) int setsockopt(int fd, int level, int option, const void *value, socklen_t size) { return mg_setsockopt_hook(fd, level, option, value, size); }
+__attribute__((visibility("default"))) int getsockname(int fd, struct sockaddr *address, socklen_t *size) { return mg_getsockname_hook(fd, address, size); }
+__attribute__((visibility("default"))) int getpeername(int fd, struct sockaddr *address, socklen_t *size) { return mg_getpeername_hook(fd, address, size); }
 __attribute__((visibility("default"))) int dup(int fd) { return mg_dup_hook(fd); }
 __attribute__((visibility("default"))) int dup2(int oldfd, int newfd) { return mg_dup2_hook(oldfd, newfd); }
 __attribute__((visibility("default"))) int dup3(int oldfd, int newfd, int flags) { return mg_dup3_hook(oldfd, newfd, flags); }

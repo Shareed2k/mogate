@@ -48,3 +48,11 @@ func (s *Server) rewriteDNSAddrPort(destination netip.AddrPort) netip.AddrPort {
 	}
 	return netip.AddrPortFrom(s.dnsServer, 53)
 }
+
+func reportedDNSAddrPort(rewrites map[netip.AddrPort]netip.AddrPort, source netip.AddrPort) netip.AddrPort {
+	source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+	if requested, ok := rewrites[source]; ok {
+		return requested
+	}
+	return source
+}

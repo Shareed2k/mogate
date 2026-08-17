@@ -20,6 +20,8 @@ This repository is an engineering foundation, not a feature-complete interceptio
 | Incoming TCP steal/mirror tunnel | Implemented and tested | Implemented and tested |
 | Incoming UDP steal/mirror tunnel | Implemented and tested | Implemented and tested |
 | DNS A/AAAA lookup | Implemented and tested | Implemented and tested |
+| Raw UDP/TCP DNS on port 53, including c-ares | Implemented and k3s-tested | Implemented |
+| Virtual `getsockname`/`getpeername` identity | Implemented and k3s-tested | Implemented and tested |
 | Absolute-path `open`/`openat` | Implemented | Implemented and tested |
 | Remote `read`/`write`/`close` | Implemented | Implemented and tested |
 | Remote `lseek`/`fstat` | Implemented | Implemented |
@@ -121,11 +123,14 @@ container. It verifies:
 
 - TCP and UDP passthrough when no local session is attached;
 - incoming TCP and UDP stealing by a local process;
+- incoming TCP and UDP stealing into an application running inside Docker;
 - cluster DNS resolution from an injected native process;
 - injected blocking and nonblocking TCP egress through the pod network namespace;
 - `poll`/`select` plus the host platform's `epoll` or `kqueue` readiness path;
 - descriptor aliasing and connected/unconnected UDP egress;
 - portable UDP ancillary metadata across a macOS client and Linux k3s agent.
+- real injected programs: Bash `/dev/tcp`, `curl`, `wget`, `telnet`, and
+  `dig` over both UDP and TCP.
 
 Requirements are Docker, `kubectl`, a C compiler, and Go 1.24 or newer. Run:
 
@@ -186,6 +191,20 @@ MOGATE_TOKEN='the-same-random-token' \
 Commands launched from that shell inherit the injection. If the command itself
 starts the application, replace `bash` with that command. After sourcing the
 shell helper, the short form is `mogate-dev bash`.
+
+For egress-only use, pass `--incoming=false`. This avoids claiming the single
+incoming watcher while preserving injected cluster DNS plus TCP and UDP
+egress:
+
+```sh
+MOGATE_TOKEN='the-same-random-token' \
+  bin/mogate dev --incoming=false --egress-control 127.0.0.1:30001 -- bash
+```
+
+Raw DNS clients that send directly to the local resolver on port 53 are
+forwarded to the agent's cluster resolver. When the destination is rewritten,
+the response still reports the originally requested DNS peer, preserving the
+source validation used by asynchronous resolvers such as c-ares.
 
 ## Embedding
 

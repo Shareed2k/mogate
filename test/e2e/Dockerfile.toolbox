@@ -6,12 +6,16 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY injector ./injector
+COPY pkg ./pkg
+COPY test/e2e/fixture.go ./test/e2e/fixture.go
 RUN go build -trimpath -o /out/mogate ./cmd/mogate
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mogate-fixture ./test/e2e/fixture.go
 RUN sed -n '/^\/\*$/,/^\*\/$/p' injector/main.go | sed '1d;$d;/^#cgo /d' | \
     cc -x c -Iinjector -O2 -fPIC -shared -ldl -pthread -o /out/libmogate.so -
 
 FROM alpine:3.22
 RUN apk add --no-cache bash bind-tools busybox-extras ca-certificates curl wget
 COPY --from=build /out/mogate /usr/local/bin/mogate
+COPY --from=build /out/mogate-fixture /usr/local/bin/mogate-fixture
 COPY --from=build /out/libmogate.so /usr/local/bin/libmogate.so
 ENTRYPOINT ["/usr/local/bin/mogate"]
