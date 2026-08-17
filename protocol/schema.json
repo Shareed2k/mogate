@@ -21,7 +21,8 @@
     {"go": "OpFileClose", "c": "MG_OP_FILE_CLOSE", "value": 15},
     {"go": "OpUDPConnectMetadata", "c": "MG_OP_UDP_CONNECT_METADATA", "value": 16},
     {"go": "OpUDPSendMsg", "c": "MG_OP_UDP_SEND_MSG", "value": 17},
-    {"go": "OpUDPReceiveMsg", "c": "MG_OP_UDP_RECEIVE_MSG", "value": 18}
+    {"go": "OpUDPReceiveMsg", "c": "MG_OP_UDP_RECEIVE_MSG", "value": 18},
+    {"go": "OpEnvGet", "c": "MG_OP_ENV_GET", "value": 19}
   ],
   "address": {
     "family_ipv4": 4,

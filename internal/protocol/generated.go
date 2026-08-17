@@ -39,4 +39,5 @@ const (
 	OpUDPConnectMetadata Operation = 16
 	OpUDPSendMsg         Operation = 17
 	OpUDPReceiveMsg      Operation = 18
+	OpEnvGet             Operation = 19
 )

@@ -13,15 +13,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"time"
+
+	"github.com/creack/pty"
 
 	"github.com/shareed2k/mogate/internal/egress"
 	"github.com/shareed2k/mogate/internal/incoming"
+	"github.com/shareed2k/mogate/internal/protocol"
 	"github.com/shareed2k/mogate/internal/session"
 	"github.com/shareed2k/mogate/internal/sessiontransport"
 )
@@ -57,10 +65,56 @@ type Config struct {
 	// MaxConnections bounds concurrent connections. A value of zero or less
 	// selects the internal default of 256.
 	MaxConnections int
+	// EnvInclude, when non-empty, restricts the target environment overlay
+	// (Modes.Env) to exactly these keys. An empty slice overlays every target
+	// key that survives the default and EnvExclude filters.
+	EnvInclude []string
+	// EnvExclude names additional target environment keys to drop from the
+	// overlay, on top of the built-in defaults that protect local execution
+	// and toolchain paths.
+	EnvExclude []string
 	// Modes selects which capabilities are active for the session.
 	Modes Modes
 	// Logger receives session diagnostics. A nil logger writes to stderr.
 	Logger *slog.Logger
+
+	// Stdin is the reader wired to the injected child's standard input. A nil
+	// reader selects os.Stdin, keeping the CLI/default path unchanged. When Pty is
+	// set, the caller SHOULD close Stdin (or cancel the run ctx) at teardown; a
+	// live reader that never reaches EOF -- an io.Pipe or a websocket bridge --
+	// would otherwise wedge the internal copy goroutine. As a backstop the
+	// injector closes an io.Closer Stdin on ctx cancel (and on child exit) to
+	// release that goroutine, so the caller must expect its Stdin to be closed.
+	Stdin io.Reader
+	// Stdout is the writer wired to the injected child's standard output. A nil
+	// writer selects os.Stdout, keeping the CLI/default path unchanged.
+	Stdout io.Writer
+	// Stderr is the writer wired to the injected child's standard error. A nil
+	// writer selects os.Stderr, keeping the CLI/default path unchanged. When Pty
+	// is set the child's stderr is folded into the pty, so this is not wired.
+	Stderr io.Writer
+	// Pty, when set, allocates a pseudo-terminal and runs the child as a session
+	// leader with that tty as its controlling terminal, wiring Stdin/Stdout to
+	// the pty master. It gives programs that require a real terminal (a shell,
+	// vim) a working tty, at the cost of merging stdout and stderr onto one
+	// stream. When false the child's streams are wired directly (default). When
+	// set, an io.Closer Stdin is closed at teardown (child exit or ctx cancel) to
+	// release the internal stdin copy goroutine; see the Stdin contract above.
+	Pty bool
+	// ResizeCh, when Pty is set, delivers terminal window sizes; each value
+	// resizes the pty. It is optional -- a nil channel leaves the pty at its
+	// default size. The caller owns and closes the channel; execute never does.
+	ResizeCh <-chan Winsize
+}
+
+// Winsize is a terminal window size in character cells. It is the exported,
+// dependency-free form a caller uses to drive Config.ResizeCh without importing
+// the pty package.
+type Winsize struct {
+	// Rows is the terminal height in character cells.
+	Rows uint16
+	// Cols is the terminal width in character cells.
+	Cols uint16
 }
 
 // Modes selects which capabilities participate in an Injection Session.
@@ -71,6 +125,9 @@ type Modes struct {
 	Incoming bool
 	// Files enables remote file redirection for the injected command.
 	Files bool
+	// Env overlays the target container's environment onto the spawned child,
+	// filtered by the built-in defaults plus Config.EnvInclude/EnvExclude.
+	Env bool
 }
 
 // Run establishes the local egress relay, attaches the incoming tunnels when
@@ -111,6 +168,22 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 		return err
 	}
 
+	// The target environment overlay is best-effort: it is fetched synchronously
+	// here, after the relay socket is ready and before the command is spawned, so
+	// a slow or failed fetch can never race or block the child. A failure leaves
+	// targetEnv nil and the child runs with no overlay -- exactly as when Env is
+	// off. Values are never logged; only a count is emitted at debug.
+	var targetEnv map[string]string
+	if cfg.Modes.Env {
+		fetched, fetchErr := fetchTargetEnv(runCtx, cfg.Socket)
+		if fetchErr != nil {
+			logger.Debug("skipping target environment overlay", "error", fetchErr)
+		} else {
+			targetEnv = filterEnv(fetched, cfg.EnvInclude, cfg.EnvExclude)
+			logger.Debug("prepared target environment overlay", "count", len(targetEnv))
+		}
+	}
+
 	tasks := []session.Task{
 		{Name: "outbound relay", Run: func(taskCtx context.Context) error {
 			stopped := make(chan struct{})
@@ -148,6 +221,12 @@ func Run(ctx context.Context, cfg Config, command []string) error {
 			library:        cfg.InjectorLib,
 			libraryRosetta: cfg.InjectorLibRosetta,
 			files:          cfg.Modes.Files && cfg.Root != "",
+			targetEnv:      targetEnv,
+			stdin:          cfg.Stdin,
+			stdout:         cfg.Stdout,
+			stderr:         cfg.Stderr,
+			pty:            cfg.Pty,
+			resize:         cfg.ResizeCh,
 		}, command)
 	}})
 	return session.Run(runCtx, tasks...)
@@ -177,6 +256,22 @@ type injectionOptions struct {
 	library        string
 	libraryRosetta string
 	files          bool
+	// targetEnv is the already-filtered target container environment overlaid
+	// onto the child. A nil map (Modes.Env off, or a failed/empty fetch) leaves
+	// the injected environment byte-identical to the no-overlay behavior.
+	targetEnv map[string]string
+	// stdin, stdout, and stderr are the optional caller-supplied streams for the
+	// child. A nil value resolves to the matching os.Std* file (see
+	// resolveStreams), keeping the default path byte-identical.
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+	// pty allocates a pseudo-terminal for the child and pumps its I/O over the
+	// resolved stdin/stdout; when false the streams are wired directly.
+	pty bool
+	// resize delivers terminal window sizes while pty is set. It is optional and
+	// owned by the caller; a nil channel leaves the pty at its default size.
+	resize <-chan Winsize
 }
 
 // selectInjector picks the injector matching the slice command[0] was thinned
@@ -256,18 +351,157 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 	}
 	cmd := exec.CommandContext(ctx, execPath)
 	cmd.Args = argv
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = injectedEnvironment(os.Environ(), options, library)
-	if err := cmd.Run(); err != nil {
+
+	// Resolve the effective streams once. With all three nil (the CLI/default
+	// path) they are exactly os.Stdin/os.Stdout/os.Stderr, so the wiring below is
+	// byte-identical to the historical behavior.
+	stdin, stdout, stderr := resolveStreams(options)
+
+	var runErr error
+	if options.pty {
+		// A pty exposes a single tty: the child's stdin, stdout, and stderr are
+		// all the slave, so stderr is folded into stdout and not wired separately.
+		runErr = runWithPty(ctx, cmd, stdin, stdout, options.resize)
+	} else {
+		cmd.Stdin = stdin
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		runErr = cmd.Run()
+	}
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			return fmt.Errorf("command exited with status %d", exitErr.ExitCode())
 		}
-		return fmt.Errorf("run command: %w", err)
+		return fmt.Errorf("run command: %w", runErr)
 	}
 	return nil
+}
+
+// resolveStreams returns the effective child streams, substituting the matching
+// os.Std* file for each nil stream. Keeping the defaulting in one place makes
+// the no-stream path (all three nil) provably identical to os.Std* wiring.
+func resolveStreams(options injectionOptions) (stdin io.Reader, stdout io.Writer, stderr io.Writer) {
+	stdin, stdout, stderr = options.stdin, options.stdout, options.stderr
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	return stdin, stdout, stderr
+}
+
+// runWithPty starts cmd on a freshly allocated pseudo-terminal (creack/pty sets
+// Setsid+Setctty and wires the child's std fds to the slave) and pumps its I/O
+// to the supplied streams. It returns the child's raw wait error; execute maps a
+// non-zero exit to the "command exited with status N" message, keeping that
+// mapping single-sourced.
+//
+// Every goroutine is bounded by the child's lifetime:
+//   - the master->stdout pump returns once the master is closed after the child
+//     exits (its read then reports EOF/EIO), draining the final output;
+//   - the resize pump returns when pumpCtx is cancelled (child exit or a
+//     cancelled ctx) or when the caller closes ResizeCh;
+//   - the stdin->master pump returns when stdin reaches EOF, when a write to the
+//     closed master fails, or when the stdin watcher closes an io.Closer stdin.
+//
+// A live stdin that never reaches EOF -- an io.Pipe or a websocket bridge, which
+// is honey's web-terminal case -- would otherwise wedge the stdin pump's Read
+// forever and leak on both child exit and a cancelled ctx, because the pump does
+// not itself watch pumpCtx. To bound it, a watcher closes an io.Closer stdin when
+// pumpCtx is cancelled (child exit or a cancelled ctx); io.Pipe, net.Conn and
+// os.File all abort an in-flight Read on Close. A stdin that is not an io.Closer
+// (e.g. bytes.Reader) is finite and returns EOF on its own, so it needs no
+// watcher and keeps its prior behavior. Nothing here closes ResizeCh -- the
+// caller owns it.
+//
+// The join order matters: the resize pump touches the master (pty.Setsize reads
+// its fd), so it is stopped and joined BEFORE the master is closed, ruling out a
+// Setsize/Close data race; the master is then closed to unblock the output pump.
+// The stdin watcher and, when it is present, the stdin pump are joined last, so a
+// closable stdin leaves no goroutine behind on either exit path.
+func runWithPty(ctx context.Context, cmd *exec.Cmd, stdin io.Reader, stdout io.Writer, resize <-chan Winsize) error {
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("start command with pty: %w", err)
+	}
+
+	// pumpCtx bounds the resize pump to the child's lifetime: it is cancelled on
+	// child exit below, and also when the caller cancels ctx.
+	pumpCtx, stopPumps := context.WithCancel(ctx)
+	defer stopPumps()
+
+	// resize: apply window sizes until the child exits, ctx is cancelled, or the
+	// caller closes ResizeCh. A nil resize channel never fires, so the pump then
+	// waits solely on pumpCtx.
+	resizeDone := make(chan struct{})
+	go func() {
+		defer close(resizeDone)
+		for {
+			select {
+			case <-pumpCtx.Done():
+				return
+			case ws, ok := <-resize:
+				if !ok {
+					return
+				}
+				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols})
+			}
+		}
+	}()
+
+	// output: master -> stdout, draining the child's output until the master is
+	// closed after it exits.
+	outputDone := make(chan struct{})
+	go func() {
+		defer close(outputDone)
+		_, _ = io.Copy(stdout, ptmx)
+	}()
+
+	// input: stdin -> master. The copy ends when stdin reaches EOF, when a write
+	// to the closed master fails, or -- for a live reader that never reaches EOF
+	// -- when the watcher below closes an io.Closer stdin.
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		_, _ = io.Copy(ptmx, stdin)
+	}()
+
+	// stdin watcher: only a closable stdin can be unblocked, so the watcher (and
+	// the input-pump join) exist solely for that case. When pumpCtx is cancelled
+	// (child exit via stopPumps below, or a cancelled ctx) it closes the reader,
+	// aborting a blocked Read that would otherwise leak the input pump.
+	var watcherDone chan struct{}
+	if stdinCloser, ok := stdin.(io.Closer); ok {
+		watcherDone = make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			<-pumpCtx.Done()
+			_ = stdinCloser.Close()
+		}()
+	}
+
+	waitErr := cmd.Wait()
+	stopPumps()
+	<-resizeDone // no pty.Setsize is in flight once this returns
+	// Closing the master unblocks the output pump's read (it reports EOF/EIO even
+	// if a grandchild still holds the slave open) and fails any pending write from
+	// the input pump.
+	_ = ptmx.Close()
+	<-outputDone
+	// Join the stdin watcher and, for a closable stdin, the input pump: the
+	// watcher has closed the reader and the master is closed, so both the pump's
+	// Read and any pending Write are now released -- no goroutine outlives return.
+	if watcherDone != nil {
+		<-watcherDone
+		<-inputDone
+	}
+	return waitErr
 }
 
 // assembleExec builds the (execPath, argv) pair execute runs. For the non-script
@@ -297,6 +531,14 @@ func assembleExec(origArg0 string, command []string, res sipResult) (execPath st
 // and platform loader variable pointing at library.
 func injectedEnvironment(base []string, options injectionOptions, library string) []string {
 	env := append([]string(nil), base...)
+	// Overlay the filtered target environment first, so remote values win over a
+	// local var of the same name, while the MOGATE_*/loader variables set below
+	// still win over any same-named target value. Keys are applied in sorted
+	// order for a reproducible child environment. A nil map is a no-op, keeping
+	// the no-overlay path byte-identical.
+	for _, key := range slices.Sorted(maps.Keys(options.targetEnv)) {
+		env = setEnv(env, key, options.targetEnv[key])
+	}
 	env = setEnv(env, "MOGATE_SOCKET", options.socket)
 	if options.files {
 		env = setEnv(env, "MOGATE_FILE_MODE", "remote")
@@ -352,4 +594,140 @@ func envValue(env []string, key string) string {
 		}
 	}
 	return ""
+}
+
+// envFetchTimeout bounds the best-effort target environment fetch so a
+// wedged relay or agent can never stall the command it precedes.
+const envFetchTimeout = 10 * time.Second
+
+// bundlerOrigPrefix marks the variables Bundler saves off before rewriting the
+// execution environment (BUNDLER_ORIG_PATH, BUNDLER_ORIG_GEM_HOME, ...). They
+// describe the target's own toolchain paths and must never leak onto the child.
+const bundlerOrigPrefix = "BUNDLER_ORIG_"
+
+// defaultEnvExclude is the set of target environment keys that are always kept
+// local. They select executables, interpreters, and language toolchain paths,
+// so importing the target's values would make the child resolve the wrong
+// binaries or libraries. Callers extend it through Config.EnvExclude.
+var defaultEnvExclude = map[string]struct{}{
+	"PATH":              {},
+	"HOME":              {},
+	"HOMEPATH":          {},
+	"CLASSPATH":         {},
+	"JAVA_EXE":          {},
+	"JAVA_HOME":         {},
+	"JAVA_TOOL_OPTIONS": {},
+	"_JAVA_OPTIONS":     {},
+	"CATALINA_HOME":     {},
+	"GEM_HOME":          {},
+	"GEM_PATH":          {},
+	"GOPATH":            {},
+	"PYTHONPATH":        {},
+	"BUNDLE_PATH":       {},
+	"BUNDLE_BIN_PATH":   {},
+	"BUNDLE_GEM_PATH":   {},
+}
+
+// filterEnv selects the target environment variables that may be overlaid onto
+// the spawned child. When include is non-empty only those keys are candidates;
+// otherwise every key is a candidate. A key is then dropped when it is in the
+// default exclude set, in exclude, or carries the BUNDLER_ORIG_ prefix, so the
+// child always keeps its own execution and toolchain paths. The returned map is
+// fresh and target is never mutated.
+func filterEnv(target map[string]string, include, exclude []string) map[string]string {
+	includeSet := toSet(include)
+	excludeSet := toSet(exclude)
+	filtered := make(map[string]string, len(target))
+	for key, value := range target {
+		if len(includeSet) > 0 {
+			if _, ok := includeSet[key]; !ok {
+				continue
+			}
+		}
+		if _, ok := defaultEnvExclude[key]; ok {
+			continue
+		}
+		if _, ok := excludeSet[key]; ok {
+			continue
+		}
+		if strings.HasPrefix(key, bundlerOrigPrefix) {
+			continue
+		}
+		filtered[key] = value
+	}
+	return filtered
+}
+
+// toSet turns keys into a lookup set, ignoring empty entries.
+func toSet(keys []string) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		set[key] = struct{}{}
+	}
+	return set
+}
+
+// fetchTargetEnv asks the in-Pod agent for the target container's environment
+// over the relay Unix socket via the M1 OpEnvGet operation, reusing the same
+// frame round-trip the injector speaks. It is synchronous and bounded by
+// envFetchTimeout, spawns no goroutine, and returns the parsed KEY=VALUE
+// entries. Every failure (dial, frame, parse, or a non-zero agent status) is
+// returned so the caller can log it at debug and skip the overlay; it never
+// logs environment values.
+func fetchTargetEnv(ctx context.Context, socket string) (map[string]string, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, envFetchTimeout)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(fetchCtx, "unix", socket)
+	if err != nil {
+		return nil, fmt.Errorf("dial relay socket: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := fetchCtx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	if err := protocol.WriteFrame(conn, protocol.Frame{Operation: protocol.OpEnvGet}); err != nil {
+		return nil, fmt.Errorf("request target environment: %w", err)
+	}
+	frame, err := protocol.ReadFrame(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read target environment: %w", err)
+	}
+	errno, data, err := protocol.ParseStatus(frame.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("parse target environment status: %w", err)
+	}
+	if errno != 0 {
+		return nil, fmt.Errorf("agent reported errno %d for target environment", errno)
+	}
+	return parseEnvPayload(data), nil
+}
+
+// parseEnvPayload turns the agent's newline-separated KEY=VALUE payload into a
+// map. Entries without a '=' or with an empty key are skipped; a value may
+// itself contain '=' (only the first is the separator). It never logs values.
+func parseEnvPayload(data []byte) map[string]string {
+	result := make(map[string]string)
+	if len(data) == 0 {
+		return result
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found || key == "" {
+			continue
+		}
+		result[key] = value
+	}
+	return result
 }
