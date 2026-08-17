@@ -13,6 +13,9 @@
 #else
 #include <sys/epoll.h>
 #endif
+#ifndef POLLWRNORM
+#define POLLWRNORM 0x0100
+#endif
 
 static int wait_connected(int fd, const char *network) {
     if (strcmp(network, "tcp-select") == 0) {
@@ -45,6 +48,15 @@ static int wait_connected(int fd, const char *network) {
         return ready == 1 && (event.events & EPOLLOUT) && event.data.u64 == 0x12345678 ? 0 : -1;
     }
 #endif
+    if (strcmp(network, "tcp-poll-write") == 0) {
+        // Regression for the injector translating only POLLOUT: a client that
+        // also sets POLLWRNORM (curl does) must still block until the relay
+        // connect status arrives, not see the always-writable relay socket as
+        // ready. On the unfixed injector POLLWRNORM leaks through and poll
+        // reports ready with revents==POLLWRNORM (no POLLOUT), so this fails.
+        struct pollfd pending = {.fd = fd, .events = POLLOUT | POLLWRNORM};
+        return poll(&pending, 1, 5000) == 1 && (pending.revents & POLLOUT) ? 0 : -1;
+    }
     struct pollfd pending = {.fd = fd, .events = POLLOUT};
     return poll(&pending, 1, 5000) == 1 && (pending.revents & POLLOUT) ? 0 : -1;
 }
@@ -87,7 +99,8 @@ static int request(const char *network, const char *host, const char *port, cons
             break;
         }
         if (strncmp(network, "tcp-nonblocking", 15) == 0 || strcmp(network, "tcp-select") == 0 ||
-            strcmp(network, "tcp-kqueue") == 0 || strcmp(network, "tcp-epoll") == 0) {
+            strcmp(network, "tcp-kqueue") == 0 || strcmp(network, "tcp-epoll") == 0 ||
+            strcmp(network, "tcp-poll-write") == 0) {
             int flags = fcntl(fd, F_GETFL, 0);
             if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
                 close(fd); fd = -1; continue;
@@ -192,7 +205,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc != 5) {
-        fprintf(stderr, "usage: %s tcp|tcp-nonblocking|tcp-select|tcp-kqueue|tcp-epoll|tcp-dup|udp|udp-unconnected|udp-ancillary host port expected\n", argv[0]);
+        fprintf(stderr, "usage: %s tcp|tcp-nonblocking|tcp-select|tcp-kqueue|tcp-epoll|tcp-poll-write|tcp-dup|udp|udp-unconnected|udp-ancillary host port expected\n", argv[0]);
         return 2;
     }
     return request(argv[1], argv[2], argv[3], argv[4]);

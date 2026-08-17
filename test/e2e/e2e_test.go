@@ -169,6 +169,17 @@ func TestK3sE2E(t *testing.T) {
 			t.Fatalf("unexpected %s egress output %q", readinessMode, output)
 		}
 	})
+	// Regression: a non-blocking connect readiness wait that sets POLLWRNORM in
+	// addition to POLLOUT (curl does) must still block until the relay connect
+	// status frame arrives. The unfixed poll hook translated only POLLOUT, so
+	// the always-writable relay socket reported ready early and the connect was
+	// reported as failed.
+	t.Run("injected tcp-poll-write egress", func(t *testing.T) {
+		output := runDevClient(t, ctx, root, nativeClient, incomingPort, egressPort, "--udp=false", "tcp-poll-write")
+		if !strings.Contains(output, "remote-cluster-api") {
+			t.Fatalf("unexpected tcp-poll-write egress output %q", output)
+		}
+	})
 	t.Run("injected cluster dns and udp egress", func(t *testing.T) {
 		output := runDevClient(t, ctx, root, nativeClient, incomingPort, egressPort, "--udp=true", "udp")
 		if !strings.Contains(output, "remote-cluster-api") {
