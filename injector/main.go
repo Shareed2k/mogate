@@ -1331,6 +1331,21 @@ static int mg_prepare_tcp_io(int fd) {
 	return 1;
 }
 
+// A pending relay connect is completed by reading its status frame, so the
+// injector redirects a caller's write-readiness wait (connect-done) to a
+// read-readiness wait on the relay socket. Write readiness is not only POLLOUT:
+// curl (and any XSI poller) also sets POLLWRNORM/POLLWRBAND. The relay socket is
+// an always-writable AF_UNIX fd, so any untranslated write bit makes poll report
+// ready before the status frame arrives; the caller then reads SO_ERROR ==
+// EINPROGRESS and gives up. Translate ALL write-readiness bits, not just POLLOUT.
+#ifndef POLLWRNORM
+#define POLLWRNORM 0x0100
+#endif
+#ifndef POLLWRBAND
+#define POLLWRBAND 0x0200
+#endif
+#define MG_POLL_WRITE (POLLOUT | POLLWRNORM | POLLWRBAND)
+
 static int mg_poll_hook(struct pollfd *descriptors, nfds_t count, int timeout) {
 	if (mg_inside || mg_symbols() < 0) return mg_real_poll ? mg_real_poll(descriptors, count, timeout) : -1;
 	struct pollfd *translated = calloc(count ? count : 1, sizeof(*translated));
@@ -1338,8 +1353,8 @@ static int mg_poll_hook(struct pollfd *descriptors, nfds_t count, int timeout) {
 	for (nfds_t index = 0; index < count; index++) {
 		translated[index] = descriptors[index];
 		struct mg_virtual_descriptor *descriptor = mg_descriptor_for(descriptors[index].fd);
-		if (descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_PENDING && (descriptors[index].events & POLLOUT)) {
-			translated[index].events &= (short)~POLLOUT;
+		if (descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_PENDING && (descriptors[index].events & MG_POLL_WRITE)) {
+			translated[index].events &= (short)~MG_POLL_WRITE;
 			translated[index].events |= POLLIN;
 		}
 	}
@@ -1349,12 +1364,12 @@ static int mg_poll_hook(struct pollfd *descriptors, nfds_t count, int timeout) {
 		for (nfds_t index = 0; index < count; index++) {
 			descriptors[index].revents = translated[index].revents;
 			struct mg_virtual_descriptor *descriptor = mg_descriptor_for(descriptors[index].fd);
-			if (descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_PENDING && (descriptors[index].events & POLLOUT)) {
+			if (descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_PENDING && (descriptors[index].events & MG_POLL_WRITE)) {
 				descriptors[index].revents &= (short)~POLLIN;
 				if (translated[index].revents & (POLLIN | POLLHUP | POLLERR)) {
 					(void)mg_finalize_tcp(descriptors[index].fd, 0);
 					descriptor = mg_descriptor_for(descriptors[index].fd);
-					descriptors[index].revents |= POLLOUT;
+					descriptors[index].revents |= (descriptors[index].events & MG_POLL_WRITE);
 					if (descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_FAILED) descriptors[index].revents |= POLLERR;
 				}
 			}
@@ -1387,12 +1402,23 @@ static void mg_epoll_remove_locked(struct mg_epoll_watch *watch) {
 	}
 }
 
+// Same write-readiness set as MG_POLL_WRITE, for epoll: a pending relay connect
+// waits for its status frame (EPOLLIN), so every write-readiness bit the caller
+// registered must be redirected, not only EPOLLOUT (see mg_poll_hook).
+#ifndef EPOLLWRNORM
+#define EPOLLWRNORM 0x0100
+#endif
+#ifndef EPOLLWRBAND
+#define EPOLLWRBAND 0x0200
+#endif
+#define MG_EPOLL_WRITE (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)
+
 static int mg_epoll_ctl_hook(int epoll_fd, int operation, int fd, struct epoll_event *event) {
 	if (mg_inside || mg_symbols() < 0)
 		return mg_real_epoll_ctl ? mg_real_epoll_ctl(epoll_fd, operation, fd, event) : -1;
 	struct mg_virtual_descriptor *descriptor = mg_descriptor_for(fd);
 	int pending_write = descriptor && descriptor->kind == MG_DESCRIPTOR_TCP_PENDING && event &&
-		(operation == EPOLL_CTL_ADD || operation == EPOLL_CTL_MOD) && (event->events & EPOLLOUT);
+		(operation == EPOLL_CTL_ADD || operation == EPOLL_CTL_MOD) && (event->events & MG_EPOLL_WRITE);
 	if (!pending_write) {
 		int result = mg_real_epoll_ctl(epoll_fd, operation, fd, event);
 		if (result == 0 && (operation == EPOLL_CTL_MOD || operation == EPOLL_CTL_DEL)) {
@@ -1404,7 +1430,7 @@ static int mg_epoll_ctl_hook(int epoll_fd, int operation, int fd, struct epoll_e
 		return result;
 	}
 	struct epoll_event translated = *event;
-	translated.events = (translated.events & ~EPOLLOUT) | EPOLLIN;
+	translated.events = (translated.events & ~MG_EPOLL_WRITE) | EPOLLIN;
 	pthread_mutex_lock(&mg_epoll_lock);
 	struct mg_epoll_watch *watch = mg_epoll_find_locked(epoll_fd, fd, 0);
 	int created = 0;
