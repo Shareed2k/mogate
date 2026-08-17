@@ -392,12 +392,16 @@ func (s *Server) handleUDP(ctx context.Context, client net.Conn, address string)
 }
 
 func (s *Server) handleTCP(ctx context.Context, client net.Conn, address string) error {
+	requested := address
 	address = s.rewriteDNSAddress(address)
+	s.config.Logger.Info("diag egress tcp connect requested", "requested", requested, "dialed", address)
 	dialer := net.Dialer{Timeout: s.config.DialTimeout}
 	remote, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
+		s.config.Logger.Warn("diag egress tcp connect failed", "requested", requested, "dialed", address, "error", err.Error())
 		return s.respond(client, protocol.OpTCPConnect, errnoOf(err), nil)
 	}
+	s.config.Logger.Info("diag egress tcp connect ok", "requested", requested, "dialed", address, "local", remote.LocalAddr().String(), "remote", remote.RemoteAddr().String())
 	defer func() { _ = remote.Close() }()
 	if err := s.respond(client, protocol.OpTCPConnect, 0, nil); err != nil {
 		return err
