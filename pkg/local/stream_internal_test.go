@@ -232,3 +232,31 @@ func resizeChan(size Winsize) chan Winsize {
 	ch <- size
 	return ch
 }
+
+// TestWrapRunError asserts execute's error contract: a non-zero child exit is
+// wrapped so a caller can errors.As back to the *exec.ExitError and read the
+// numeric code (the honey recipe path relies on this for failed_when), while
+// the human-readable prefix is preserved; a non-exit error is wrapped plainly
+// and nil passes through.
+func TestWrapRunError(t *testing.T) {
+	if err := wrapRunError(nil); err != nil {
+		t.Fatalf("wrapRunError(nil) = %v, want nil", err)
+	}
+
+	runErr := exec.Command("/bin/sh", "-c", "exit 3").Run()
+	err := wrapRunError(runErr)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("wrapRunError(%v) does not unwrap to *exec.ExitError", runErr)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Fatalf("exit code = %d, want 3", exitErr.ExitCode())
+	}
+	if !strings.Contains(err.Error(), "command exited with status 3") {
+		t.Fatalf("message %q missing human-readable prefix", err.Error())
+	}
+
+	if err := wrapRunError(errors.New("boom")); !strings.Contains(err.Error(), "run command: boom") {
+		t.Fatalf("non-exit error = %q, want wrapped 'run command: boom'", err.Error())
+	}
+}

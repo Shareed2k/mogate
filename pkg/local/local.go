@@ -369,14 +369,24 @@ func execute(ctx context.Context, options injectionOptions, command []string) er
 		cmd.Stderr = stderr
 		runErr = cmd.Run()
 	}
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			return fmt.Errorf("command exited with status %d", exitErr.ExitCode())
-		}
-		return fmt.Errorf("run command: %w", runErr)
+	return wrapRunError(runErr)
+}
+
+// wrapRunError maps a child's wait error to execute's return contract. A
+// non-zero exit is wrapped with %w around the original *exec.ExitError (rather
+// than formatting only its status into a fresh string) so a caller can
+// errors.As back to it and recover the numeric exit code; the human-readable
+// prefix is unchanged. Any other error is wrapped plainly, and nil passes
+// through.
+func wrapRunError(runErr error) error {
+	if runErr == nil {
+		return nil
 	}
-	return nil
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return fmt.Errorf("command exited with status %d: %w", exitErr.ExitCode(), runErr)
+	}
+	return fmt.Errorf("run command: %w", runErr)
 }
 
 // resolveStreams returns the effective child streams, substituting the matching
